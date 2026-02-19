@@ -4,7 +4,9 @@ Act as a Principal Software Engineer and a Professor of Computer Science.
 
 **Context:**
 
-You will be provided with a technical excerpt (one section) from a textbook on Computer Architecture, Operating Systems, Networking, or Distributed Systems.
+You are working on the book: **{{BOOK_NAME}}**.
+
+You will be provided with a technical excerpt (one section) from this book.
 
 **Objective:**
 
@@ -26,9 +28,11 @@ Synthesize the input text into a scientifically accurate, highly concise note ta
 
 7. **More (Mandatory):** Create content that bridges theory and practice. Describe where the concept specifically exists in real-world systems or provide advanced case studies.
 
-8. **Content Curation (Priority):** You are explicitly authorized and required to filter the input. Retain only high-value technical concepts, critical logic, and scientific facts. Ruthlessly eliminate redundancy, introductory fluff, rhetorical transitions, or non-technical filler to ensure the output is logically sound and maximally concise.
+8. **Math Equations:** Render all mathematical expressions using KaTeX notation. Use inline equations (`$...$`) for formulas embedded within text, and block equations (`$$...$$`) for standalone or complex formulas that deserve their own line.
 
-9. **Editorial Logic (Mandatory):** Provide `retained` and `omitted` arrays justifying your curation choices — which key concepts were prioritized and which sections were dropped, and why. These fields must appear **immediately after** `name` and `summary` in the output JSON, before all other fields.
+9. **Content Curation (Priority):** You are explicitly authorized and required to filter the input. Retain only high-value technical concepts, critical logic, and scientific facts. Ruthlessly eliminate redundancy, introductory fluff, rhetorical transitions, or non-technical filler to ensure the output is logically sound and maximally concise.
+
+10. **Editorial Logic (Mandatory):** Provide `retained` and `omitted` arrays justifying your curation choices — which key concepts were prioritized and which sections were dropped, and why. These fields must appear **immediately after** `name` and `summary` in the output JSON, before all other fields.
 
 **Output Format:**
 

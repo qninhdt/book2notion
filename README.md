@@ -1,23 +1,29 @@
 # book2notion
 
-Convert technical books (PDF + HTML) into structured, LLM-summarized Markdown and JSON notes — optimized for study, reference, and technical interview prep.
+Convert technical books (PDF + HTML) into structured, LLM-summarized Markdown and JSON notes — then sync them to a Notion workspace with rich formatting.
+
+![Demo](./images/notion.png)
 
 ## Overview
 
-The pipeline has two stages:
+The pipeline has three stages:
 
 ```
 content.pdf + content.html
         │
         ▼
-  convert_book.py          →  content.json  +  images/
+  convert_book.py       →  content.json  +  images/
         │
         ▼
-  summarize_book.py         →  outputs/<chapter>.json  +  outputs/<chapter>.md
+  summarize_book.py     →  outputs/<chapter>.json  +  outputs/<chapter>.md
+        │
+        ▼
+  sync_to_notion.py     →  Notion: Books DB → Book Page → Chapters DB → Chapter Page
 ```
 
-1. **`convert_book.py`** — Extracts the TOC from the PDF and uses it to parse the HTML into a structured `content.json`, saving embedded images to `images/`.
+1. **`convert_book.py`** — Extracts the TOC from the PDF and parses the HTML into a structured `content.json`, saving embedded images to `images/`.
 2. **`summarize_book.py`** — Feeds each section from `content.json` to an LLM (OpenAI-compatible API) and writes per-chapter `.json` and `.md` notes.
+3. **`sync_to_notion.py`** — Reads the per-chapter JSON outputs and uploads them to Notion as richly formatted pages with headings, tables, toggles, images, code blocks, and math equations.
 
 ## Directory Structure
 
@@ -33,6 +39,7 @@ books/
       1. Chapter.md      ← rendered Markdown notes
 prompts/
   summarize.md           ← system prompt for the LLM
+sync_to_notion.py        ← Notion sync script
 ```
 
 ## Setup
@@ -40,7 +47,7 @@ prompts/
 **1. Install dependencies**
 
 ```bash
-pip install openai tqdm python-dotenv beautifulsoup4 PyPDF2
+pip install -r requirements.txt
 ```
 
 **2. Configure environment**
@@ -48,10 +55,22 @@ pip install openai tqdm python-dotenv beautifulsoup4 PyPDF2
 Copy `.env.example` to `.env` and fill in your values:
 
 ```dotenv
+# LLM (for summarization)
 LLM_BASE_URL=https://api.openai.com/v1   # any OpenAI-compatible endpoint
 LLM_API_KEY=sk-...
 LLM_ID=gpt-4o                            # model identifier
+
+# Notion (for sync)
+NOTION_API_KEY=secret_...                # Notion integration token
+NOTION_PAGE_ID=...                       # Parent page ID (from the page URL)
+
+# Optional: base URL prefix if images are hosted remotely
+# IMAGE_BASE_URL=https://example.com/books
 ```
+
+**3. Connect Notion integration**
+
+In Notion, open the parent page you set as `NOTION_PAGE_ID`, click **···** → **Connections**, and add your integration. This grants the script permission to create databases and pages under that page.
 
 ## Usage
 
@@ -60,26 +79,64 @@ LLM_ID=gpt-4o                            # model identifier
 Place `content.pdf` and `content.html` inside `books/<Book Name>/`, then run:
 
 ```bash
-python convert_book.py "books/DDIA"
+python convert_book.py "books/My Book"
 ```
 
-This produces `books/DDIA/content.json` and saves images to `books/DDIA/images/`.
-
 Supported TOC formats:
-- **named** — `Chapter N. Title` chapters with plain-text sections (O'Reilly / DDIA style)
+- **named** — `Chapter N. Title` chapters with plain-text sections (O'Reilly style)
 - **numbered** — `Chapter N Title` or `N. Title` chapters with `N.N` numbered sections (textbook style)
 
 ### Step 2 — Summarize with LLM
 
 ```bash
 # All chapters
-python summarize_book.py --book "DDIA"
+python summarize_book.py --book "My Book"
 
-# Specific chapters
-python summarize_book.py --book "DDIA" --chapter 1 --chapter 3
+# Specific chapters only
+python summarize_book.py --book "My Book" --chapter 1 --chapter 3
 ```
 
 Already-processed chapters are skipped automatically (resume-safe).
+
+### Step 3 — Sync to Notion
+
+```bash
+# All books and chapters
+python sync_to_notion.py
+
+# A specific book only
+python sync_to_notion.py --book "My Book"
+
+# Re-sync even already-uploaded chapters
+python sync_to_notion.py --book "My Book" --force
+```
+
+The script is idempotent — existing chapters are skipped unless `--force` is passed.
+
+## Notion Structure
+
+```
+Parent Page
+└── Books Database
+    └── <Book Name> (page)
+        └── Chapters Database (inline)
+            ├── 1. Chapter One (page)
+            ├── 2. Chapter Two (page)
+            └── ...
+```
+
+Each chapter page renders the structured JSON as Notion blocks:
+
+| Markdown element | Notion block |
+|------------------|--------------|
+| `# Heading` / `## Subheading` | Heading 1 / Heading 2 (with `1.` / `1.1` prefix) |
+| Paragraphs, bullet/numbered lists | Paragraph, Bulleted/Numbered list |
+| ` ``` lang ``` ` | Code block (language auto-detected) |
+| `\$...\$` / `\$\$...\$\$` | Inline / block equation |
+| `![caption](path)` | Image (uploaded to Notion) with caption |
+| GFM tables | Notion table with header row |
+| `interview` JSON field | **Interview** toggle → quote per Q&A → nested **Answer** toggle |
+| `more` JSON field | **More** toggle → content blocks |
 
 ## Output Format
 
@@ -88,7 +145,7 @@ Each chapter produces two files in `outputs/`:
 | File | Description |
 |------|-------------|
 | `<N>. <Chapter>.json` | Raw structured LLM output (sections array) |
-| `<N>. <Chapter>.md` | Rendered Markdown ready for import into Notion or any notes app |
+| `<N>. <Chapter>.md` | Rendered Markdown notes |
 
 ### JSON schema per section
 
@@ -96,14 +153,12 @@ Each chapter produces two files in `outputs/`:
 {
   "name": "Section Title",
   "summary": "One-sentence summary.",
-  "retained": [{ "name": "concept", "reason": "why kept" }],
-  "omitted":  [{ "name": "concept", "reason": "why dropped" }],
   "subsections": [
     {
       "name": "Subheading",
-      "content": "Markdown content",
+      "content": "Markdown content (paragraphs, lists, tables, code, math)",
       "figures": [
-        { "caption": "Alt text of image", "id": 1 }
+        { "caption": "Image description", "id": 1 }
       ]
     }
   ],
@@ -115,43 +170,20 @@ Each chapter produces two files in `outputs/`:
 }
 ```
 
-### Markdown structure per section
+## Configuration Reference
 
-```
-# Section Title
-<one-sentence summary>
+### Environment variables
 
-## Subheading
-<bullet points / paragraphs>
-![figure caption](images/image_0001.jpeg)
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `LLM_BASE_URL` | Yes (summarize) | OpenAI-compatible API base URL |
+| `LLM_API_KEY` | Yes (summarize) | API key |
+| `LLM_ID` | Yes (summarize) | Model identifier (e.g. `gpt-4o`) |
+| `NOTION_API_KEY` | Yes (sync) | Notion integration token |
+| `NOTION_PAGE_ID` | Yes (sync) | Parent page ID |
+| `IMAGE_BASE_URL` | No | Base URL for externally hosted images |
 
-```go
-// code block (if applicable)
-```
-
-__*Interview:*__
-> **Question:** ... (level: senior)
-> **Answer:** ...
-
-__*More:*__
-### Real-World Topic
-<real-world context>
-
----
-Editorial Logic:
-Retained: ...
-Omitted:  ...
-```
-
-## Configuration
-
-| Environment variable | Description |
-|----------------------|-------------|
-| `LLM_BASE_URL` | OpenAI-compatible API base URL |
-| `LLM_API_KEY` | API key |
-| `LLM_ID` | Model identifier (e.g. `gpt-4o`, `claude-3-opus`) |
-
-Advanced constants in `summarize_book.py`:
+### Advanced constants in `summarize_book.py`
 
 | Constant | Default | Description |
 |----------|---------|-------------|

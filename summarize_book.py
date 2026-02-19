@@ -36,7 +36,7 @@ load_dotenv()
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 PROMPT_NAME = "summarize"  # prompts/summarize.md
 
-TIMEOUT_SECONDS = 160  # per LLM call timeout
+TIMEOUT_SECONDS = 180  # per LLM call timeout
 MAX_RETRIES = 3  # number of retry attempts on timeout/error
 MAX_WORKERS = 8  # max concurrent threads per chapter
 
@@ -418,7 +418,8 @@ def main():
         sys.exit(0)
 
     # Setup
-    system_prompt = load_prompt(args.prompt)
+    book_name = book_dir.name
+    system_prompt = load_prompt(args.prompt).replace("{{BOOK_NAME}}", book_name)
     client = build_client()
     model = os.environ.get("LLM_ID", "gpt-4o")
     output_dir = book_dir / "outputs"
