@@ -34,7 +34,7 @@ load_dotenv()
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID")
 IMAGE_BASE_URL = os.getenv("IMAGE_BASE_URL", "").rstrip("/")
-BOOKS_DIR = Path(__file__).parent / "books"
+OUTPUTS_DIR = Path(__file__).parent / "outputs"
 BATCH_SIZE = 100
 
 notion: Client = None
@@ -369,7 +369,7 @@ def _is_block_start(line):
     )
 
 
-def md_to_blocks(text):
+def md_to_blocks(text, book_dir=None):
     if not text:
         return []
     blocks = []
@@ -416,10 +416,7 @@ def md_to_blocks(text):
 
         im = re.match(r"^!\[([^\]]*)\]\(([^\)]+)\)", s)
         if im:
-            blocks.append({"type": "image", "image": {
-                "type": "external", "external": {"url": im.group(2)},
-                "caption": parse_inline(im.group(1)),
-            }})
+            blocks.append(_build_md_image(im.group(2), im.group(1), book_dir))
             i += 1; continue
 
         if _is_table_row(s):
@@ -446,6 +443,85 @@ def md_to_blocks(text):
         blocks.append({"type": "paragraph", "paragraph": {"rich_text": parse_inline(" ".join(pl))}})
 
     return blocks
+
+
+def _resolve_local_image(image_ref, book_dir):
+    """Resolve a markdown image reference to a local file if present."""
+    if not image_ref:
+        return None
+    if re.match(r"^https?://", image_ref):
+        return None
+
+    rel = image_ref.lstrip("./")
+    candidates = [
+        book_dir / "chapters" / rel,
+        book_dir / rel,
+        book_dir / "hybrid_auto" / "images" / rel,
+        book_dir / "images" / rel,
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p
+
+    # Compatibility mapping between image_XXXX and figure_XXXX naming.
+    m = re.match(
+        r"^(?:images/)?(?P<prefix>image|figure)_(?P<num>\d{4})\.(?P<ext>png|jpe?g|gif|webp)$",
+        rel,
+        re.IGNORECASE,
+    )
+    if m:
+        num = m.group("num")
+        prefixes = ("figure", "image")
+        exts = (".png", ".jpeg", ".jpg", ".gif", ".webp")
+        for pref in prefixes:
+            for ext in exts:
+                for p in (
+                    book_dir / "chapters" / f"{pref}_{num}{ext}",
+                    book_dir / f"{pref}_{num}{ext}",
+                    book_dir / "images" / f"{pref}_{num}{ext}",
+                    book_dir / "hybrid_auto" / "images" / f"{pref}_{num}{ext}",
+                ):
+                    if p.exists() and p.is_file():
+                        return p
+    return None
+
+
+def _build_md_image(path, caption="", book_dir=None):
+    caption_rt = parse_inline(caption)[:25] if caption else []
+
+    # Upload local image when possible.
+    if book_dir is not None:
+        local = _resolve_local_image(path, book_dir)
+        if local is not None:
+            try:
+                uid = upload_image(local)
+                return {"type": "image", "image": {
+                    "type": "file_upload", "file_upload": {"id": uid},
+                    "caption": caption_rt,
+                }}
+            except Exception as e:
+                print(f"      [warn] Upload failed {local.name}: {e}")
+
+    # If markdown path is already a URL, use it directly.
+    if re.match(r"^https?://", path):
+        return {"type": "image", "image": {
+            "type": "external", "external": {"url": path},
+            "caption": caption_rt,
+        }}
+
+    # Build external URL from configured base if available.
+    if IMAGE_BASE_URL and book_dir is not None:
+        url = f"{IMAGE_BASE_URL}/{url_quote(book_dir.name)}/{url_quote(path)}"
+        return {"type": "image", "image": {
+            "type": "external", "external": {"url": url},
+            "caption": caption_rt,
+        }}
+
+    # Last resort: keep raw path as external URL (legacy behavior).
+    return {"type": "image", "image": {
+        "type": "external", "external": {"url": path},
+        "caption": caption_rt,
+    }}
 
 
 def _parse_list(lines, i, bullet=True):
@@ -534,7 +610,7 @@ def build_section(section, sec_idx, book_dir):
             "type": "heading_2",
             "heading_2": {"rich_text": [_rt(f"{sec_idx}.{si} {sub['name']}")]},
         })
-        blocks.extend(md_to_blocks(sub.get("content", "")))
+        blocks.extend(md_to_blocks(sub.get("content", ""), book_dir))
         for fig in sub.get("figures") or []:
             blocks.append(_build_figure(fig, book_dir))
 
@@ -585,7 +661,9 @@ def build_section(section, sec_idx, book_dir):
             children.append({"type": "heading_3", "heading_3": {
                 "rich_text": [_rt(m["name"], bold=True)],
             }})
-            children.extend(_flatten_children(md_to_blocks(m.get("content", ""))))
+            children.extend(
+                _flatten_children(md_to_blocks(m.get("content", ""), book_dir))
+            )
         blocks.append({
             "type": "toggle",
             "toggle": {
@@ -636,22 +714,28 @@ def _build_figure(fig, book_dir):
 
     # Try local image upload
     if fid is not None and book_dir is not None:
-        for ext in (".jpeg", ".jpg", ".png", ".gif", ".webp"):
-            img_path = book_dir / "images" / f"image_{fid:04d}{ext}"
-            if img_path.exists():
-                try:
-                    uid = upload_image(img_path)
-                    return {"type": "image", "image": {
-                        "type": "file_upload", "file_upload": {"id": uid},
-                        "caption": caption_rt,
-                    }}
-                except Exception as e:
-                    print(f"      [warn] Upload failed {img_path.name}: {e}")
-                break
+        for ext in (".png", ".jpeg", ".jpg", ".gif", ".webp"):
+            for pref in ("figure", "image"):
+                for img_path in (
+                    book_dir / "chapters" / f"{pref}_{fid:04d}{ext}",
+                    book_dir / f"{pref}_{fid:04d}{ext}",
+                    book_dir / "hybrid_auto" / "images" / f"{pref}_{fid:04d}{ext}",
+                    book_dir / "images" / f"{pref}_{fid:04d}{ext}",
+                ):
+                    if img_path.exists():
+                        try:
+                            uid = upload_image(img_path)
+                            return {"type": "image", "image": {
+                                "type": "file_upload", "file_upload": {"id": uid},
+                                "caption": caption_rt,
+                            }}
+                        except Exception as e:
+                            print(f"      [warn] Upload failed {img_path.name}: {e}")
+                        break
 
     # Fallback: external URL
     if IMAGE_BASE_URL and fid is not None:
-        url = f"{IMAGE_BASE_URL}/{url_quote(book_dir.name)}/images/image_{fid:04d}.jpeg"
+        url = f"{IMAGE_BASE_URL}/{url_quote(book_dir.name)}/figure_{fid:04d}.png"
         return {"type": "image", "image": {
             "type": "external", "external": {"url": url}, "caption": caption_rt,
         }}
@@ -762,11 +846,18 @@ def sync_chapter(ch_ds_id, path, book_dir, ch_num, cache):
 
 def sync_book(books_ds_id, book_dir):
     name = book_dir.name
-    out = book_dir / "outputs"
-    if not out.exists():
+    chapters_dir = book_dir / "chapters"
+    if not chapters_dir.exists():
+        # Backward compatibility for old layout
+        legacy_out = book_dir / "outputs"
+        chapters_dir = legacy_out if legacy_out.exists() else None
+    if chapters_dir is None:
         return
 
-    jsons = sorted((p for p in out.glob("*.json") if not p.name.startswith(".")), key=_ch_sort_key)
+    jsons = sorted(
+        (p for p in chapters_dir.glob("*.json") if not p.name.startswith(".")),
+        key=_ch_sort_key,
+    )
     if not jsons:
         return
 
@@ -783,7 +874,7 @@ def sync_book(books_ds_id, book_dir):
         print(f"    Created book entry")
 
     _, ch_ds_id = get_or_create_chapters_db(page_id)
-    cache = _load_cache(out)
+    cache = _load_cache(chapters_dir)
 
     for jf in jsons:
         ch_num = _ch_sort_key(jf)
@@ -792,7 +883,7 @@ def sync_book(books_ds_id, book_dir):
         except Exception as e:
             print(f"    [error] {jf.stem}: {e}")
 
-    _save_cache(out, cache)
+    _save_cache(chapters_dir, cache)
 
 
 def main():
@@ -813,7 +904,7 @@ def main():
     _, books_ds_id = get_or_create_books_db(page_id)
     print(f"Books database ready")
 
-    for d in sorted(BOOKS_DIR.iterdir()):
+    for d in sorted(OUTPUTS_DIR.iterdir()):
         if d.is_dir() and (not args.book or d.name == args.book):
             sync_book(books_ds_id, d)
 

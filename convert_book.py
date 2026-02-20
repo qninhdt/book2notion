@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-Convert book to JSON format using TOC from PDF and content from HTML
-Directory structure: ./books/[book name]/{content.pdf, content.html, images/, content.json}
+Convert book to JSON format using:
+- TOC from books/{name}.pdf
+- OCR data from outputs/{name}/hybrid_auto/{name}_content_list_v2.json
 
-Supports two book formats:
-  - numbered: "Chapter N Name" chapters + "N.N Section" sections (e.g., Computer Architecture)
-  - named:    "Chapter N. Name" chapters + plain-text sections (e.g., DDIA/O'Reilly books)
+Uses pymupdf to extract TOC with page numbers, then matches TOC headings
+to OCR title elements using soft matching constrained by expected page numbers.
 """
 import json
 import re
+import shutil
 import sys
-import base64
+from difflib import SequenceMatcher
 from pathlib import Path
-from bs4 import BeautifulSoup, NavigableString
-import PyPDF2
 
+import fitz  # pymupdf
 
-# Sections to exclude (case-insensitive match on section name)
 EXCLUDE_PATTERNS = [
     r"key\s+terms",
     r"review\s+questions",
@@ -28,745 +27,657 @@ EXCLUDE_PATTERNS = [
     r"recommended\s+reading",
     r"^references$",
     r"^summary$",
+    r"^conclusion$",
     r"^homework",
     r"^mlfq:\s*summary$",
 ]
 
+TOC_BOOKEND_EXCLUDE_PATTERNS = [
+    r"^cover$",
+    r"^copyright$",
+    r"^brief\s+contents$",
+    r"^table\s+of\s+contents$",
+    r"^contents$",
+    r"^preface$",
+    r"^acknowledg(e)?ments$",
+    r"^references$",
+    r"^bibliography$",
+    r"^index$",
+    r"^about\s+the\s+authors$",
+    r"^colophon$",
+]
+
 
 def should_exclude_section(section_name):
-    """Check if a section should be excluded based on its name"""
     name_lower = section_name.lower().strip()
-    for pattern in EXCLUDE_PATTERNS:
-        if re.search(pattern, name_lower):
-            return True
-    return False
+    return any(re.search(p, name_lower) for p in EXCLUDE_PATTERNS)
+
+
+def _clean_toc_title(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _is_toc_bookend_title(title):
+    t = _clean_toc_title(title).lower()
+    return any(re.search(p, t) for p in TOC_BOOKEND_EXCLUDE_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
-# TOC extraction helpers
+# TOC extraction from PDF using pymupdf (with page numbers)
 # ---------------------------------------------------------------------------
 
 
-def _flatten_outline(outline, level=0):
-    """Flatten PDF outline into a list of {title, level} dicts"""
-    items = []
-    for item in outline:
-        if isinstance(item, list):
-            items.extend(_flatten_outline(item, level + 1))
-        elif isinstance(item, dict):
-            title = item.get("/Title", "").strip()
-            if title:
-                items.append({"title": title, "level": level})
-        else:
-            try:
-                title = item.title.strip() if hasattr(item, "title") else ""
-                if title:
-                    items.append({"title": title, "level": level})
-            except Exception:
-                pass
-    return items
-
-
-def _detect_book_format(all_items):
+def extract_toc_from_pdf(pdf_path):
+    """Extract TOC from PDF using pymupdf. Returns chapters with sections,
+    each having an expected page number (0-indexed, matching OCR page indices).
+    pymupdf's get_toc returns 1-indexed pages, so we subtract 1.
     """
-    Detect book TOC format.
-      'numbered' – chapters are "Chapter N Name", sections are "N.N Name"
-      'named'    – chapters are "Chapter N. Name", sections are plain text
-    """
-    for item in all_items:
-        title = item["title"]
-        # Named format uses a period after chapter number: "Chapter 1. Title"
-        if re.match(r"^Chapter\s+\d+\.\s+", title):
-            return "named"
-        # Numbered format: "Chapter 1 Title" (no period)
-        if re.match(r"^Chapter\s+\d+\s+\S", title):
-            return "numbered"
-    # Check for "N. Title" format (e.g., OSTEP: "2. Introduction to Operating Systems")
-    # Note: some entries may lack space after dot (e.g. "14.Interlude: Memory API")
-    for item in all_items:
-        title = item["title"]
-        if re.match(r"^\d+\.\s*\S", title) and not re.match(r"^\d+\.\d+\s", title):
-            return "numbered"
-    return "named"  # default
+    doc = fitz.open(str(pdf_path))
+    toc = doc.get_toc(simple=True)  # [level, title, page_1indexed]
+    doc.close()
 
+    if not toc:
+        print("Warning: No TOC found in PDF")
+        return {"chapters": []}
 
-def _extract_toc_numbered(all_items):
-    """Extract chapters/sections for numbered-format books.
-    Handles both 'Chapter N Title' (Computer Architecture) and 'N. Title' (OSTEP) formats.
-    """
+    normalized_toc = [
+        (level, _clean_toc_title(title), page_1indexed)
+        for level, title, page_1indexed in toc
+    ]
+
+    # Detect chapter candidates.
+    chapter_indices = [
+        i
+        for i, (_, title, _) in enumerate(normalized_toc)
+        if re.match(r"^Chapter\s+\d+[.:]?\s+", title)
+    ]
+
+    if not chapter_indices:
+        chapter_indices = [
+            i
+            for i, (_, title, _) in enumerate(normalized_toc)
+            if re.match(r"^\d+\.\s*\S", title) and not re.match(r"^\d+\.\d+", title)
+        ]
+
+    if not chapter_indices:
+        chapter_indices = [
+            i
+            for i, (_, title, _) in enumerate(normalized_toc)
+            if re.match(r"^\d+\s+\S", title)
+        ]
+
+    if not chapter_indices:
+        # Fallback: use top-level TOC entries minus obvious front/back matter.
+        min_level = min(level for level, _, _ in normalized_toc)
+        chapter_indices = [
+            i
+            for i, (level, title, _) in enumerate(normalized_toc)
+            if level == min_level and not _is_toc_bookend_title(title)
+        ]
+
+    if not chapter_indices:
+        print("Warning: No chapters found in TOC")
+        return {"chapters": []}
+
     chapters = []
-    current_chapter = None
-
-    for item in all_items:
-        title = item["title"]
-
-        # "Chapter N Title" format (Computer Architecture)
-        if title.startswith("Chapter "):
-            match = re.match(r"^Chapter\s+(\d+)\s+(.+)$", title)
-            if match:
-                chapter_num, chapter_name = match.groups()
-                current_chapter = {
-                    "number": chapter_num,
-                    "name": chapter_name.strip(),
-                    "sections": [],
-                }
-                chapters.append(current_chapter)
-
-        # "N. Title" format (OSTEP) — not a section like "N.N"
-        # Note: space after dot may be missing (e.g. "14.Interlude: Memory API")
-        elif re.match(r"^\d+\.\s*\S", title) and not re.match(r"^\d+\.\d+", title):
-            match = re.match(r"^(\d+)\.\s*(.+)$", title)
-            if match:
-                chapter_num, chapter_name = match.groups()
-                current_chapter = {
-                    "number": chapter_num,
-                    "name": chapter_name.strip(),
-                    "sections": [],
-                }
-                chapters.append(current_chapter)
-
-        # Section: "N.N Title"
-        elif re.match(r"^\d+\.\d+\s+", title) and current_chapter:
-            match = re.match(r"^(\d+)\.(\d+)\s+(.+)$", title)
-            if match:
-                chapter_num, section_num, section_name = match.groups()
-                if chapter_num == current_chapter["number"]:
-                    current_chapter["sections"].append(
-                        {
-                            "number": f"{chapter_num}.{section_num}",
-                            "name": section_name.strip(),
-                        }
-                    )
-
-    return chapters
-
-
-def _extract_toc_named(all_items):
-    """
-    Extract chapters/sections for named-format books (DDIA/O'Reilly style).
-    Chapters: items matching "Chapter N. Title" (any nesting level).
-    Sections: direct children of chapters in the outline hierarchy.
-    """
-    chapters = []
-    current_chapter = None
-    chapter_level = None
-
-    for item in all_items:
-        title = item["title"]
-        level = item["level"]
+    for ci_pos, ci in enumerate(chapter_indices):
+        level, title, page_1indexed = normalized_toc[ci]
+        page_0indexed = page_1indexed - 1
 
         ch_match = re.match(r"^Chapter\s+\d+[.:]?\s+(.+)$", title)
         if ch_match:
             chapter_name = ch_match.group(1).strip()
-            current_chapter = {"name": chapter_name, "sections": []}
-            chapters.append(current_chapter)
-            chapter_level = level
-        elif current_chapter is not None and chapter_level is not None:
-            if level == chapter_level + 1:
-                # Direct child of chapter → top-level section
-                current_chapter["sections"].append({"name": title.strip()})
+        else:
+            ch_match2 = re.match(r"^(\d+)\.\s*(.+)$", title)
+            if ch_match2:
+                chapter_name = ch_match2.group(2).strip()
+            else:
+                ch_match3 = re.match(r"^(\d+)\s+(.+)$", title)
+                chapter_name = ch_match3.group(2).strip() if ch_match3 else title.strip()
 
+        # Collect sections between this chapter and the next TOC peer.
+        # Section depth is relative to each chapter entry (handles mixed TOC levels).
+        section_level = level + 1
+        next_ci = len(toc)
+        for j in range(ci + 1, len(toc)):
+            next_level = normalized_toc[j][0]
+            if next_level <= level:
+                next_ci = j
+                break
+
+        sections = []
+        for j in range(ci + 1, next_ci):
+            s_level, s_title, s_page = normalized_toc[j]
+            if s_level == section_level:
+                sections.append({
+                    "name": s_title.strip(),
+                    "page": s_page - 1,
+                })
+
+        if not sections:
+            # Fallback for chapter-only TOCs.
+            sections.append({
+                "name": chapter_name,
+                "page": page_0indexed,
+            })
+
+        chapters.append({
+            "name": chapter_name,
+            "page": page_0indexed,
+            "end_page": normalized_toc[next_ci][2] - 1 if next_ci < len(normalized_toc) else None,
+            "sections": sections,
+        })
+
+    return {"chapters": chapters}
+
+
+# ---------------------------------------------------------------------------
+# OCR JSON loading
+# ---------------------------------------------------------------------------
+
+SKIP_TYPES = {"page_header", "page_footer", "page_number"}
+
+
+def _get_text_from_inline(items):
+    parts = []
+    for item in items:
+        if item.get("type") == "text":
+            parts.append(item["content"])
+        elif item.get("type") == "equation_inline":
+            parts.append(item["content"])
+    return "".join(parts).strip()
+
+
+def load_ocr_elements(ocr_path):
+    """Load OCR JSON. Returns (pages, flat_titles).
+    flat_titles: list of {text, page_idx, elem_idx, flat_idx}
+    """
+    with open(ocr_path, "r", encoding="utf-8") as f:
+        pages = json.load(f)
+
+    flat_titles = []
+    for page_idx, page in enumerate(pages):
+        for elem_idx, elem in enumerate(page):
+            if elem["type"] == "title":
+                text = _get_text_from_inline(
+                    elem["content"].get("title_content", [])
+                )
+                if text:
+                    flat_titles.append(
+                        {
+                            "text": text,
+                            "page_idx": page_idx,
+                            "elem_idx": elem_idx,
+                            "flat_idx": len(flat_titles),
+                        }
+                    )
+
+    return pages, flat_titles
+
+
+def _rewrite_and_copy_images_in_chapters(chapters, ocr_path):
+    """Copy only images used in extracted content and rewrite to figure_XXXX names."""
+    ocr_path = Path(ocr_path)
+    output_book_dir = ocr_path.parent.parent
+    target_dir = output_book_dir / "images"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    path_map = {}  # original content image path -> rewritten image path
+    copied = 0
+    missing = 0
+
+    image_re = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+
+    def _replace_one(match):
+        nonlocal copied, missing
+        alt = match.group(1)
+        src_rel = match.group(2).strip()
+        if not src_rel or src_rel.startswith("http://") or src_rel.startswith("https://"):
+            return match.group(0)
+
+        if src_rel in path_map:
+            return f"![{alt}]({path_map[src_rel]})"
+
+        src_path = ocr_path.parent / src_rel
+        if not src_path.exists() or not src_path.is_file():
+            print(f"Warning: Invalid image file path: {src_path}")
+            missing += 1
+            return match.group(0)
+
+        ext = src_path.suffix.lower() or ".png"
+        new_name = f"figure_{len(path_map) + 1:04d}{ext}"
+        new_rel = f"images/{new_name}"
+        target_path = target_dir / new_name
+
+        if not target_path.exists():
+            shutil.copy2(src_path, target_path)
+            copied += 1
+
+        path_map[src_rel] = new_rel
+        return f"![{alt}]({new_rel})"
+
+    for chapter in chapters:
+        for section in chapter.get("sections", []):
+            content = section.get("content", "")
+            if not content:
+                continue
+            section["content"] = image_re.sub(_replace_one, content)
+
+    print(
+        f"   Image normalize: {len(path_map)} used, {copied} copied, {missing} missing"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Soft matching with page-number constraints
+# ---------------------------------------------------------------------------
+
+
+def _normalize_for_match(text):
+    text = text.lower().strip()
+    text = re.sub(r"[\.\s]+$", "", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"^[•\-]\s+", "", text)
+    # Strip surrounding quotes (OCR sometimes wraps headings in quotes)
+    text = text.strip('"').strip('"').strip('"').strip("'")
+    return text
+
+
+def _match_score(toc_title, ocr_title):
+    a = _normalize_for_match(toc_title)
+    b = _normalize_for_match(ocr_title)
+    if a == b:
+        return 1.0
+    # Substring match only counts if the shorter string is reasonably long
+    if len(a) >= 5 and len(b) >= 5 and (a in b or b in a):
+        return 0.95
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _find_best_title_near_page(
+    toc_name, flat_titles, expected_page, search_after_idx=-1, page_tolerance=5, threshold=0.70
+):
+    """Find the best matching OCR title near the expected page.
+    Search constraints:
+      - Only consider titles on pages in [expected_page - 2, expected_page + page_tolerance]
+      - Only consider titles after search_after_idx (sequential ordering)
+      - Among candidates, prefer highest score; tie-break by last on closest page.
+    Returns (flat_idx, score) or (-1, 0).
+    """
+    page_min = expected_page - 2
+    page_max = expected_page + page_tolerance
+
+    best_idx = -1
+    best_score = 0
+    best_page_dist = float("inf")
+
+    for t in flat_titles:
+        if t["flat_idx"] <= search_after_idx:
+            continue
+        if t["page_idx"] < page_min or t["page_idx"] > page_max:
+            continue
+
+        score = _match_score(toc_name, t["text"])
+        if score < threshold:
+            continue
+
+        page_dist = abs(t["page_idx"] - expected_page)
+
+        # Prefer: higher score → closer page → later element (last on page)
+        if (score > best_score) or (
+            score == best_score and page_dist < best_page_dist
+        ) or (
+            score == best_score
+            and page_dist == best_page_dist
+            and t["flat_idx"] > best_idx
+        ):
+            best_idx = t["flat_idx"]
+            best_score = score
+            best_page_dist = page_dist
+
+    return best_idx, best_score
+
+
+# ---------------------------------------------------------------------------
+# OCR element → Markdown conversion
+# ---------------------------------------------------------------------------
+
+
+def _inline_to_md(items):
+    parts = []
+    for item in items:
+        t = item.get("type", "")
+        if t == "text":
+            parts.append(item.get("content", ""))
+        elif t == "equation_inline":
+            latex = item.get("content", "")
+            parts.append(f" ${latex}$ ")
+    return "".join(parts).strip()
+
+
+def _elem_to_md(elem):
+    etype = elem["type"]
+
+    if etype in SKIP_TYPES:
+        return ""
+
+    if etype == "title":
+        text = _get_text_from_inline(elem["content"].get("title_content", []))
+        if text:
+            return f"\n\n**{text}**\n\n"
+        return ""
+
+    content = elem.get("content", {})
+
+    if etype == "paragraph":
+        text = _inline_to_md(content.get("paragraph_content", []))
+        return text + "\n\n" if text else ""
+
+    if etype == "list":
+        items = content.get("list_items", [])
+        lines = []
+        for item in items:
+            item_text = _inline_to_md(item.get("item_content", []))
+            item_text = re.sub(r"^[•\-\*]\s*", "", item_text)
+            if item_text:
+                lines.append(f"* {item_text}")
+        return "\n".join(lines) + "\n\n" if lines else ""
+
+    if etype == "image":
+        src = content.get("image_source", {}).get("path", "")
+        caption_items = content.get("image_caption", [])
+        caption = _inline_to_md(caption_items) if caption_items else ""
+        if src:
+            return f"\n\n![{caption}]({src})\n\n"
+        return ""
+
+    if etype == "code":
+        lang = content.get("code_language", "")
+        code_text = _inline_to_md(content.get("code_content", []))
+        if code_text:
+            return f"\n```{lang}\n{code_text}\n```\n\n"
+        return ""
+
+    if etype == "algorithm":
+        algo_text = _inline_to_md(content.get("algorithm_content", []))
+        if algo_text:
+            return f"\n```\n{algo_text}\n```\n\n"
+        return ""
+
+    if etype == "table":
+        html = content.get("html", "")
+        caption_items = content.get("table_caption", [])
+        caption = _inline_to_md(caption_items) if caption_items else ""
+        if html:
+            result = ""
+            if caption:
+                result += f"**{caption}**\n\n"
+            result += html + "\n\n"
+            return result
+        img_src = content.get("image_source", {}).get("path", "")
+        if img_src:
+            result = ""
+            if caption:
+                result += f"**{caption}**\n\n"
+            result += f"![{caption}]({img_src})\n\n"
+            return result
+        return ""
+
+    if etype == "page_footnote":
+        text = _inline_to_md(content.get("page_footnote_content", []))
+        return f"\n> {text}\n\n" if text else ""
+
+    if etype == "equation_interline":
+        latex = content.get("math_content", "")
+        img_src = content.get("image_source", {}).get("path", "")
+        if latex:
+            return f"\n$$\n{latex}\n$$\n\n"
+        if img_src:
+            return f"\n![equation]({img_src})\n\n"
+        return ""
+
+    return ""
+
+
+def _extract_content_range(pages, start_page, start_elem, end_page, end_elem):
+    """Extract markdown content from OCR elements between two positions.
+    start position is inclusive of (start_page, start_elem+1) — we skip the title itself.
+    end position is exclusive.
+    """
+    parts = []
+
+    if end_page is None:
+        end_page = len(pages) - 1
+        end_elem = len(pages[end_page]) if end_page < len(pages) else 0
+
+    for page_idx in range(start_page, end_page + 1):
+        if page_idx >= len(pages):
+            break
+        page = pages[page_idx]
+
+        e_start = 0
+        e_end = len(page)
+
+        if page_idx == start_page:
+            e_start = start_elem + 1
+        if page_idx == end_page:
+            e_end = end_elem
+
+        for elem_idx in range(e_start, e_end):
+            if elem_idx >= len(page):
+                break
+            md = _elem_to_md(page[elem_idx])
+            if md.strip():
+                parts.append(md)
+
+    return "\n".join(parts).strip()
+
+
+# ---------------------------------------------------------------------------
+# Main parsing: match TOC sections to OCR titles, extract content
+# ---------------------------------------------------------------------------
+
+
+def _strip_chapter_prefix(text):
+    t = (text or "").strip()
+    t = re.sub(r"^chapter\s+\d+[.:]?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"^\d+[.:]?\s+", "", t)
+    return t.strip()
+
+
+def _strip_section_prefix(text):
+    t = (text or "").strip()
+    t = re.sub(r"^\d+(?:\.\d+)+(?:[.:])?\s+", "", t)
+    t = re.sub(r"^\d+[.:]?\s+", "", t)
+    return t.strip()
+
+
+def _normalize_titles_without_indices(chapters):
+    for chapter in chapters:
+        ch_name = chapter.get("name", "").strip()
+        if ch_name:
+            chapter["name"] = _strip_chapter_prefix(ch_name)
+
+        for section in chapter.get("sections", []):
+            sec_name = section.get("name", "").strip()
+            if sec_name:
+                section["name"] = _strip_section_prefix(sec_name)
     return chapters
 
 
-def extract_toc_from_pdf(pdf_path):
-    """
-    Extract TOC from PDF outline/bookmarks.
-    Returns {'format': 'numbered'|'named', 'chapters': [...]}
-    """
-    with open(pdf_path, "rb") as f:
-        pdf = PyPDF2.PdfReader(f)
-
-        if not pdf.outline:
-            print("Warning: No TOC found in PDF")
-            return {"format": "named", "chapters": []}
-
-        all_items = _flatten_outline(pdf.outline)
-
-    book_format = _detect_book_format(all_items)
-    if book_format == "numbered":
-        chapters = _extract_toc_numbered(all_items)
-    else:
-        chapters = _extract_toc_named(all_items)
-
-    return {"format": book_format, "chapters": chapters}
-
-
-# ---------------------------------------------------------------------------
-# Image saving
-# ---------------------------------------------------------------------------
-
-
-def save_base64_image(base64_str, output_dir, image_index):
-    """Save base64 image to file and return the filename"""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if base64_str.startswith("data:image/"):
-        match = re.match(r"data:image/([^;]+);base64,(.+)", base64_str)
-        if match:
-            img_format, img_data = match.groups()
-            img_bytes = base64.b64decode(img_data)
-            filename = f"image_{image_index:04d}.{img_format}"
-            filepath = output_dir / filename
-            with open(filepath, "wb") as f:
-                f.write(img_bytes)
-            return filename
-    return None
-
-
-# ---------------------------------------------------------------------------
-# HTML → Markdown conversion
-# ---------------------------------------------------------------------------
-
-
-def element_to_markdown(element, images_dir, image_counter):
-    """Convert an HTML element to markdown text, handling images"""
-    if isinstance(element, NavigableString):
-        return str(element)
-
-    if element.name == "img":
-        src = element.get("src", "")
-        alt = element.get("alt", "")
-        if src.startswith("data:image/"):
-            filename = save_base64_image(src, images_dir, image_counter[0])
-            if filename:
-                image_counter[0] += 1
-                return f"\n\n![{alt}](images/{filename})\n\n"
-        elif src:
-            return f"\n\n![{alt}]({src})\n\n"
-        return ""
-
-    if element.name in ["strong", "b"]:
-        inner = children_to_markdown(element, images_dir, image_counter)
-        return f"**{inner.strip()}**" if inner.strip() else ""
-
-    if element.name in ["em", "i"]:
-        inner = children_to_markdown(element, images_dir, image_counter)
-        return f"*{inner.strip()}*" if inner.strip() else ""
-
-    if element.name == "br":
-        return "\n"
-
-    if element.name in ["ul", "ol"]:
-        items = []
-        for li in element.find_all("li", recursive=False):
-            item_text = children_to_markdown(li, images_dir, image_counter).strip()
-            if item_text:
-                items.append(f"  * {item_text}")
-        return "\n".join(items) + "\n\n" if items else ""
-
-    if element.name == "table":
-        rows = []
-        for tr in element.find_all("tr"):
-            cells = [td.get_text().strip() for td in tr.find_all(["td", "th"])]
-            if any(cells):
-                rows.append(" | ".join(cells))
-        if rows:
-            return "\n" + "\n".join(rows) + "\n\n"
-        return ""
-
-    if element.name in [
-        "p",
-        "div",
-        "span",
-        "li",
-        "td",
-        "th",
-        "blockquote",
-        "figcaption",
-        "figure",
-        "section",
-        "article",
-    ]:
-        inner = children_to_markdown(element, images_dir, image_counter)
-        if element.name in ["p", "div", "blockquote"]:
-            return inner.strip() + "\n\n" if inner.strip() else ""
-        return inner
-
-    # h3/h4/h5 sub-section headings within content → bold
-    if element.name in ["h3", "h4", "h5"]:
-        text = element.get_text().strip()
-        # Skip page-number markers like "6 CHAPTER 1 / BASIC CONCEPTS..."
-        if re.match(r"^\d+\s+CHAPTER\s+\d+", text):
-            return ""
-        if text:
-            return f"\n\n**{text}**\n\n"
-        return ""
-
-    # h6 are typically page markers, skip
-    if element.name == "h6":
-        return ""
-
-    # h2 sub-headings in content (ASIDE, TIP, CRUX boxes in OSTEP) → bold
-    if element.name == "h2":
-        text = element.get_text().strip()
-        if text:
-            return f"\n\n**{text}**\n\n"
-        return ""
-
-    # h1 shouldn't appear within section content; skip safely
-    if element.name == "h1":
-        return ""
-
-    return children_to_markdown(element, images_dir, image_counter)
-
-
-def children_to_markdown(element, images_dir, image_counter):
-    """Convert all children of an element to markdown"""
-    result = ""
-    for child in element.children:
-        result += element_to_markdown(child, images_dir, image_counter)
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Numbered-format parsing (Computer Architecture)
-# ---------------------------------------------------------------------------
-
-
-def build_section_index(soup):
-    """
-    Build a dict mapping section numbers (e.g. '1.1') to their heading tags.
-    Looks for h2/h3 tags whose text starts with N.N pattern.
-    """
-    section_index = {}
-    for tag in soup.find_all(["h2", "h3"]):
-        text = re.sub(r"\s+", " ", tag.get_text().strip())
-        match = re.match(r"^(\d+\.\d+)\s+", text)
-        if match:
-            section_num = match.group(1)
-            section_index[section_num] = tag
-    return section_index
-
-
-def extract_section_content(heading_tag, images_dir, image_counter, stop_tag=None):
-    """
-    Extract content from after a numbered-format heading tag until the next
-    section boundary.
-
-    If stop_tag is provided (identity-based stopping), stops when that exact
-    tag is encountered.  Otherwise falls back to heuristic boundary detection.
-    """
-    content_parts = []
-    stop_id = id(stop_tag) if stop_tag is not None else None
-
-    for sibling in heading_tag.find_next_siblings():
-        # Identity-based stop (precise: used when we know the next section tag)
-        if stop_id is not None and id(sibling) == stop_id:
-            break
-
-        if sibling.name == "h1":
-            break
-
-        if stop_id is not None:
-            # When using explicit stop_tag, only stop at h1 or the tag itself.
-            # h2/h3 that are ASIDE/TIP/CRUX boxes become content.
-            # But skip page-marker h6 and render h2/h3/h4/h5 as bold.
-            pass
-        else:
-            # Original heuristic for Computer Architecture (no stop_tag)
-            if sibling.name in ["h2"]:
-                break
-            if sibling.name == "h3":
-                sib_text = re.sub(r"\s+", " ", sibling.get_text().strip())
-                if re.match(r"^\d+\.\d+\s+", sib_text):
-                    break
-                if sib_text.upper().startswith("CHAPTER "):
-                    break
-                if sib_text.upper().startswith("LEARNING OBJECTIVES"):
-                    break
-                # Non-section h3 (e.g. decorative) — skip without rendering
-                continue
-
-        # Skip h6 page markers (e.g. "6 CHAPTER 1 / BASIC CONCEPTS...")
-        if sibling.name == "h6":
-            text = sibling.get_text().strip()
-            if re.match(r"^\d+\s+CHAPTER\s+\d+", text) or re.match(
-                r"^[IVXLCDM]+\s+CONTENTS", text
-            ):
-                continue
-
-        md = element_to_markdown(sibling, images_dir, image_counter)
-        if md.strip():
-            content_parts.append(md)
-
-    return "\n".join(content_parts).strip()
-
-
-def parse_html_numbered(html_path, toc_chapters, images_dir):
-    """Parse HTML for numbered-format books (Computer Architecture, OSTEP)."""
-    print("   Loading HTML file...")
-    with open(html_path, "r", encoding="utf-8") as f:
-        soup = BeautifulSoup(f.read(), "html.parser")
-
-    print("   Building section index from HTML headings...")
-    section_index = build_section_index(soup)
-    print(f"   Found {len(section_index)} section headings in HTML")
-
-    # Build ordered list of all section heading tags for stop-tag computation.
-    # This ensures extraction stops precisely at the next section, even when
-    # non-section h2/h3 (ASIDE, TIP, CRUX) appear in between (as in OSTEP).
-    all_section_nums_sorted = sorted(
-        section_index.keys(), key=lambda k: [int(x) for x in k.split(".")]
-    )
-    # Map each section number to the tag of the NEXT section in document order
-    next_section_tag = {}
-    for i, sn in enumerate(all_section_nums_sorted):
-        if i + 1 < len(all_section_nums_sorted):
-            next_section_tag[sn] = section_index[all_section_nums_sorted[i + 1]]
-        else:
-            next_section_tag[sn] = None
-
-    image_counter = [1]
-    result_chapters = []
-
-    for chapter in toc_chapters:
-        print(f"\n   Chapter {chapter['number']}: {chapter['name']}")
-        result_sections = []
-
-        for section in chapter["sections"]:
-            sec_num = section["number"]
-            sec_name = section["name"]
-
-            if should_exclude_section(sec_name):
-                print(f"     Skipping {sec_num} {sec_name} (excluded)")
-                continue
-
-            heading_tag = section_index.get(sec_num)
-            if heading_tag:
-                stop_tag = next_section_tag.get(sec_num)
-                content = extract_section_content(
-                    heading_tag, images_dir, image_counter, stop_tag=stop_tag
-                )
-                if content:
-                    result_sections.append({"name": sec_name, "content": content})
-                    print(f"     {sec_num} {sec_name}: {len(content)} chars")
-                else:
-                    print(f"     {sec_num} {sec_name}: WARNING - empty content")
-                    result_sections.append({"name": sec_name, "content": ""})
-            else:
-                print(f"     {sec_num} {sec_name}: WARNING - heading not found in HTML")
-
-        if result_sections:
-            result_chapters.append(
-                {"name": chapter["name"], "sections": result_sections}
-            )
-
-    return result_chapters
-
-
-# ---------------------------------------------------------------------------
-# Named-format parsing (DDIA / O'Reilly)
-# ---------------------------------------------------------------------------
-
-
-def _normalize_heading(text):
-    """Normalize heading text for matching (lowercase, collapse whitespace)."""
-    return re.sub(r"\s+", " ", text).strip().lower()
-
-
-def _find_heading(
-    name, all_headings, start_idx=0, strip_chapter_prefix=False, max_level=None
-):
-    """
-    Return (tag, index) of the first heading in all_headings[start_idx:]
-    whose normalized text matches `name`.
-
-    Args:
-        strip_chapter_prefix: Also accept headings like "chapter 5 replication"
-            when searching for "replication".
-        max_level: If set (e.g., 3), only consider h1/h2/h3 (ignore h4/h5).
-    """
-    name_norm = _normalize_heading(name)
-    for i in range(start_idx, len(all_headings)):
-        tag = all_headings[i]
-        if max_level is not None:
-            level = int(tag.name[1]) if tag.name and tag.name[1:].isdigit() else 9
-            if level > max_level:
-                continue
-        text = _normalize_heading(tag.get_text())
-        if text == name_norm:
-            return tag, i
-        if strip_chapter_prefix:
-            stripped = re.sub(r"^chapter\s+\d+[.:]?\s*", "", text).strip()
-            if stripped == name_norm:
-                return tag, i
-    return None, -1
-
-
-def _extract_until_tag(
-    start_tag, stop_tag, chapter_heading_ids, images_dir, image_counter
-):
-    """
-    Walk find_next_siblings() from start_tag, collecting markdown.
-    Stops when:
-      - we reach stop_tag (identity check)
-      - we reach any known chapter heading
-      - we reach h1/h2
-    """
-    content_parts = []
-    stop_id = id(stop_tag) if stop_tag is not None else None
-
-    for sibling in start_tag.find_next_siblings():
-        if stop_id is not None and id(sibling) == stop_id:
-            break
-        if id(sibling) in chapter_heading_ids:
-            break
-        if sibling.name in ["h1", "h2"]:
-            break
-
-        md = element_to_markdown(sibling, images_dir, image_counter)
-        if md.strip():
-            content_parts.append(md)
-
-    return "\n".join(content_parts).strip()
-
-
-def _find_sections_for_chapter(toc_sections, all_headings, ch_pos, next_ch_pos):
-    """
-    Intelligently find section heading tags within a chapter's range.
-
-    Problem: DDIA HTML has duplicate heading names at different levels —
-    e.g., "Reliability" appears as a brief h4 intro inside "Thinking About
-    Data Systems" AND again as the actual content h4 section.
-
-    Two-phase strategy:
-      Phase 1 – Assign sections found at the canonical heading level (most
-                 common level among all matched sections).
-      Phase 2 – For sections not found at the canonical level, pick the LAST
-                 candidate within the expected TOC range (between the previous
-                 and next already-placed section). Using the LAST avoids
-                 picking brief intro sub-headings that appear before the real
-                 section content.
-
-    Returns a list of (sec_name, tag, idx) sorted by document position.
-    """
-    from collections import Counter
-
-    upper = next_ch_pos if next_ch_pos > 0 else len(all_headings)
-
-    # Collect all heading tags within the chapter range
-    range_items = [(i, all_headings[i]) for i in range(ch_pos + 1, upper)]
-
-    # Find ALL occurrences of each section name within the range
-    section_names = [sec["name"] for sec in toc_sections]
-    name_norms = [_normalize_heading(n) for n in section_names]
-    norm_to_orig = dict(zip(name_norms, section_names))
-
-    candidates = {n: [] for n in name_norms}
-    for i, tag in range_items:
-        text_norm = _normalize_heading(tag.get_text())
-        if text_norm in candidates:
-            candidates[text_norm].append((i, tag))
-
-    # Determine canonical heading level using LAST candidate for each section.
-    # The actual section heading always appears later than any brief intro with the same name,
-    # so the last candidate reflects the true section level more reliably.
-    last_levels = [int(cands[-1][1].name[1]) for cands in candidates.values() if cands]
-    canonical_level = Counter(last_levels).most_common(1)[0][0] if last_levels else 3
-
-    # Phase 1: Assign canonical-level matches (use first occurrence at canon level)
-    placed = {}  # name_norm → (idx, tag) or None
-    for nn in name_norms:
-        cands = candidates[nn]
-        at_canon = [(i, t) for i, t in cands if int(t.name[1]) == canonical_level]
-        placed[nn] = at_canon[0] if at_canon else None
-
-    # Phase 2: Fill in sections not found at canonical level
-    # Process in TOC order so that earlier placements narrow later ranges
-    for idx_in_list, nn in enumerate(name_norms):
-        if placed[nn] is not None:
-            continue
-
-        # Determine search range: after last placed predecessor, before first
-        # placed successor
-        prev_pos = ch_pos
-        for j in range(idx_in_list - 1, -1, -1):
-            prev_nn = name_norms[j]
-            if placed[prev_nn] is not None:
-                prev_pos = placed[prev_nn][0]
-                break
-
-        next_pos = upper
-        for j in range(idx_in_list + 1, len(name_norms)):
-            next_nn = name_norms[j]
-            if placed[next_nn] is not None:
-                next_pos = placed[next_nn][0]
-                break
-
-        # Among candidates in (prev_pos, next_pos), pick the LAST one.
-        # This avoids brief intro sub-headings that appear immediately after
-        # the previous section heading — the actual content section is the
-        # last occurrence before the next section boundary.
-        in_range = [(i, t) for i, t in candidates[nn] if prev_pos < i < next_pos]
-        if in_range:
-            placed[nn] = in_range[-1]  # LAST in range
-
-    # Build final sorted result
-    result = []
-    for nn, orig_name in zip(name_norms, section_names):
-        p = placed[nn]
-        if p is None:
-            result.append((orig_name, None, -1))
-        else:
-            result.append((orig_name, p[1], p[0]))
-
-    # Sort by document position (preserves reading order)
-    result.sort(key=lambda x: x[2] if x[2] >= 0 else float("inf"))
-    return result
-
-
-def parse_html_named(html_path, toc_chapters, images_dir):
-    """Parse HTML for named-format books (DDIA / O'Reilly style)."""
-    print("   Loading HTML file...")
-    with open(html_path, "r", encoding="utf-8") as f:
-        soup = BeautifulSoup(f.read(), "html.parser")
-
-    # Flat ordered list of ALL headings (h1–h5) for sequential search
-    all_headings = soup.find_all(["h1", "h2", "h3", "h4", "h5"])
-    print(f"   Found {len(all_headings)} total headings in HTML")
-
-    # Pass 1: Locate every chapter heading (only h1/h2/h3 — never h4/h5)
-    chapter_positions = []  # [(chapter, tag, idx)]
-    search_from = 0
-    for chapter in toc_chapters:
-        tag, idx = _find_heading(
-            chapter["name"],
-            all_headings,
-            search_from,
-            strip_chapter_prefix=True,
-            max_level=3,
-        )
-        chapter_positions.append((chapter, tag, idx))
-        if idx >= 0:
-            search_from = idx + 1
-
-    found_count = sum(1 for _, t, _ in chapter_positions if t is not None)
-    print(f"   Located {found_count} / {len(toc_chapters)} chapter headings")
-
-    # Collect chapter heading ids for use as stop boundaries
-    chapter_heading_ids = {id(t) for _, t, _ in chapter_positions if t is not None}
-
-    image_counter = [1]
-    result_chapters = []
-
-    for ch_i, (chapter, ch_tag, ch_pos) in enumerate(chapter_positions):
-        if ch_tag is None:
-            print(f"\n   WARNING: Chapter '{chapter['name']}' not found — skipping")
-            continue
-
-        # Determine the range for this chapter (up to the next chapter heading)
-        next_ch_pos = len(all_headings)
-        for j in range(ch_i + 1, len(chapter_positions)):
-            if chapter_positions[j][2] >= 0:
-                next_ch_pos = chapter_positions[j][2]
-                break
-
-        print(f"\n   Chapter: {chapter['name']}")
-
-        # Pass 2: Smart section matching within chapter range
-        section_tags = _find_sections_for_chapter(
-            chapter["sections"], all_headings, ch_pos, next_ch_pos
-        )
-
-        # Pass 3: Extract content for each section (stop at next section tag)
-        result_sections = []
-        for i, (sec_name, sec_tag, _) in enumerate(section_tags):
-            if should_exclude_section(sec_name):
-                print(f"     Skipping '{sec_name}' (excluded)")
-                continue
-
-            if sec_tag is None:
-                print(f"     WARNING: Section '{sec_name}' not found in HTML")
-                continue
-
-            # stop_tag = next FOUND section tag in this chapter
-            stop_tag = None
-            for j in range(i + 1, len(section_tags)):
-                if section_tags[j][1] is not None:
-                    stop_tag = section_tags[j][1]
-                    break
-
-            content = _extract_until_tag(
-                sec_tag, stop_tag, chapter_heading_ids, images_dir, image_counter
-            )
-
-            if content:
-                result_sections.append({"name": sec_name, "content": content})
-                print(f"     {sec_name}: {len(content)} chars")
-            else:
-                print(f"     '{sec_name}': WARNING - empty content")
-
-        if result_sections:
-            result_chapters.append(
-                {"name": chapter["name"], "sections": result_sections}
-            )
-
-    return result_chapters
-
-
-# ---------------------------------------------------------------------------
-# Dispatcher
-# ---------------------------------------------------------------------------
-
-
-def parse_html_with_toc(html_path, toc_result, images_dir):
-    """Dispatch to numbered or named HTML parser based on book format."""
-    book_format = toc_result["format"]
+def parse_ocr_with_toc(ocr_path, toc_result):
     toc_chapters = toc_result["chapters"]
 
-    if book_format == "numbered":
-        return parse_html_numbered(html_path, toc_chapters, images_dir)
-    else:
-        return parse_html_named(html_path, toc_chapters, images_dir)
+    print("\n2. Loading OCR JSON...")
+    pages, flat_titles = load_ocr_elements(ocr_path)
+    print(f"   {len(pages)} pages, {len(flat_titles)} title elements")
+
+    print("\n3. Matching TOC sections to OCR titles...")
+
+    # Build a flat list of ALL sections (including excluded ones as boundary markers)
+    all_sections = []
+    for ch_i, chapter in enumerate(toc_chapters):
+        for sec_i, section in enumerate(chapter["sections"]):
+            all_sections.append(
+                {
+                    "ch_idx": ch_i,
+                    "sec_idx": sec_i,
+                    "name": section["name"],
+                    "expected_page": section["page"],
+                    "excluded": should_exclude_section(section["name"]),
+                }
+            )
+
+    # Match each section sequentially (including excluded ones for boundary tracking)
+    matched_sections = []  # {ch_idx, name, flat_title_idx, page_idx, elem_idx, excluded}
+    prev_matched_flat_idx = -1
+
+    for sec_info in all_sections:
+        flat_idx, score = _find_best_title_near_page(
+            sec_info["name"],
+            flat_titles,
+            sec_info["expected_page"],
+            search_after_idx=prev_matched_flat_idx,
+        )
+
+        if flat_idx < 0:
+            ch_name = toc_chapters[sec_info["ch_idx"]]["name"]
+            tag = " (excluded)" if sec_info["excluded"] else ""
+            print(
+                f"    WARNING: '{sec_info['name']}'{tag} (expected page {sec_info['expected_page']}) "
+                f"not found in chapter '{ch_name}'"
+            )
+            continue
+
+        t = flat_titles[flat_idx]
+        ch_name = toc_chapters[sec_info["ch_idx"]]["name"]
+        tag = " [boundary]" if sec_info["excluded"] else ""
+        print(
+            f"    [{ch_name}] '{sec_info['name']}' → "
+            f"'{t['text']}' (page {t['page_idx']}, score={score:.2f}){tag}"
+        )
+
+        matched_sections.append(
+            {
+                "ch_idx": sec_info["ch_idx"],
+                "name": sec_info["name"],
+                "flat_title_idx": flat_idx,
+                "page_idx": t["page_idx"],
+                "elem_idx": t["elem_idx"],
+                "excluded": sec_info["excluded"],
+            }
+        )
+        prev_matched_flat_idx = flat_idx
+
+    content_sections = [ms for ms in matched_sections if not ms["excluded"]]
+    print(f"\n4. Extracting content for {len(content_sections)} sections...")
+
+    result_chapters = {}  # ch_idx → {name, sections:[]}
+
+    for ms_pos, ms in enumerate(matched_sections):
+        if ms["excluded"]:
+            continue
+
+        # End boundary: next matched section's position (including excluded ones)
+        end_page = None
+        end_elem = None
+        if ms_pos + 1 < len(matched_sections):
+            nxt = matched_sections[ms_pos + 1]
+            end_page = nxt["page_idx"]
+            end_elem = nxt["elem_idx"]
+        else:
+            chapter_end_page = toc_chapters[ms["ch_idx"]].get("end_page")
+            if chapter_end_page is not None and chapter_end_page >= ms["page_idx"]:
+                end_page = chapter_end_page
+                end_elem = 0
+
+        content = _extract_content_range(
+            pages, ms["page_idx"], ms["elem_idx"], end_page, end_elem
+        )
+
+        ch_idx = ms["ch_idx"]
+        ch_name = toc_chapters[ch_idx]["name"]
+
+        if ch_idx not in result_chapters:
+            result_chapters[ch_idx] = {"name": ch_name, "sections": []}
+
+        if content:
+            result_chapters[ch_idx]["sections"].append(
+                {"name": ms["name"], "content": content}
+            )
+            print(f"     [{ch_name}] {ms['name']}: {len(content)} chars")
+        else:
+            print(f"     [{ch_name}] {ms['name']}: WARNING - empty content")
+
+    # Return chapters in order, only those with sections
+    ordered = [
+        result_chapters[k]
+        for k in sorted(result_chapters.keys())
+        if result_chapters[k]["sections"]
+    ]
+    ordered = _normalize_titles_without_indices(ordered)
+    _rewrite_and_copy_images_in_chapters(ordered, ocr_path)
+    return ordered
 
 
-def convert_book(book_dir):
-    """Convert a book from its directory"""
-    book_path = Path(book_dir)
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-    if not book_path.exists():
-        print(f"Error: Directory {book_dir} not found")
-        return
 
-    pdf_path = book_path / "content.pdf"
-    html_path = book_path / "content.html"
+def _normalize_book_name(book_input):
+    raw = str(book_input).strip().rstrip("/\\")
+    if not raw:
+        return raw
+    p = Path(raw)
+    if p.suffix.lower() == ".pdf":
+        return p.stem
+    return p.name
+
+
+def _resolve_input_paths(name):
+    pdf_path = Path("books") / f"{name}.pdf"
+    ocr_path = Path("outputs") / name / "hybrid_auto" / f"{name}_content_list_v2.json"
+    return pdf_path, ocr_path
+
+
+def convert_book(book_name):
+    name = _normalize_book_name(book_name)
+    if not name:
+        print("Error: Empty book name")
+        return False
+
+    pdf_path, ocr_path = _resolve_input_paths(name)
 
     if not pdf_path.exists():
-        print(f"Error: content.pdf not found in {book_dir}")
-        return
-    if not html_path.exists():
-        print(f"Error: content.html not found in {book_dir}")
-        return
+        print(f"Error: PDF not found: {pdf_path}")
+        return False
+    if not ocr_path.exists():
+        print(f"Error: OCR JSON not found: {ocr_path}")
+        return False
 
-    images_dir = book_path / "images"
-    images_dir.mkdir(exist_ok=True)
-
-    print(f"\nProcessing book: {book_path.name}")
+    print(f"\nProcessing book: {name}")
     print("=" * 60)
 
-    # Step 1: Extract TOC from PDF
     print("\n1. Extracting TOC from PDF...")
     toc_result = extract_toc_from_pdf(pdf_path)
     toc_chapters = toc_result["chapters"]
-    book_format = toc_result["format"]
-    print(f"   Format: {book_format}")
     print(f"   Found {len(toc_chapters)} chapters")
 
     if not toc_chapters:
         print("Error: Could not extract TOC from PDF")
-        return
+        return False
 
-    # Step 2: Parse HTML using TOC
-    print("\n2. Parsing HTML content using TOC...")
-    chapters = parse_html_with_toc(html_path, toc_result, images_dir)
+    for ch in toc_chapters:
+        print(f"   - {ch['name']} ({len(ch['sections'])} sections)")
 
-    # Step 3: Create JSON output
-    print("\n\n3. Creating JSON output...")
+    chapters = parse_ocr_with_toc(ocr_path, toc_result)
+
+    print("\n\n5. Creating JSON output...")
     output_data = {"chapters": chapters}
 
-    output_path = book_path / "content.json"
+    output_path = Path("outputs") / name / "content.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2, ensure_ascii=False)
 
@@ -778,9 +689,70 @@ def convert_book(book_dir):
     print(f"  Chapters: {len(chapters)}")
     print(f"  Sections: {total_sections}")
     print(f"  Total content: {total_chars:,} characters")
-    print(f"  Images saved to: {images_dir}")
+    return True
 
 
 if __name__ == "__main__":
-    book_dir = sys.argv[1] if len(sys.argv) > 1 else "books/Computer Architecture"
-    convert_book(book_dir)
+    if len(sys.argv) > 1:
+        ok = convert_book(sys.argv[1])
+        sys.exit(0 if ok else 1)
+    else:
+        output_root = Path("outputs")
+        if not output_root.exists():
+            print("Error: outputs directory not found")
+            sys.exit(1)
+
+        book_dirs = sorted([p for p in output_root.iterdir() if p.is_dir()])
+        if not book_dirs:
+            print("Error: No books found under outputs/")
+            sys.exit(1)
+
+        runnable_books = []
+        skipped_books = []
+        for book_dir in book_dirs:
+            pdf_path, ocr_path = _resolve_input_paths(book_dir.name)
+            missing = []
+            if not pdf_path.exists():
+                missing.append(str(pdf_path))
+            if not ocr_path.exists():
+                missing.append(str(ocr_path))
+            if missing:
+                skipped_books.append((book_dir.name, missing))
+            else:
+                runnable_books.append(book_dir.name)
+
+        if not runnable_books:
+            print("Error: No books with complete inputs found.")
+            sys.exit(1)
+
+        print(
+            f"Found {len(runnable_books)} runnable books under outputs/ "
+            f"(skipped {len(skipped_books)} with missing inputs)."
+        )
+        for book_name, missing in skipped_books:
+            print(f"Skipping {book_name}:")
+            for item in missing:
+                print(f"  - missing {item}")
+
+        failed_books = []
+        for book_dir in book_dirs:
+            if book_dir.name not in runnable_books:
+                continue
+            try:
+                ok = convert_book(book_dir.name)
+            except Exception as exc:
+                print(f"Error: Unexpected failure for {book_dir.name}: {exc}")
+                ok = False
+
+            if not ok:
+                failed_books.append(book_dir.name)
+
+        print(
+            f"\nRun summary: success={len(runnable_books) - len(failed_books)}, "
+            f"failed={len(failed_books)}, skipped={len(skipped_books)}"
+        )
+        if failed_books:
+            print("Failed books:")
+            for name in failed_books:
+                print(f"  - {name}")
+            sys.exit(1)

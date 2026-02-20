@@ -36,7 +36,7 @@ load_dotenv()
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 PROMPT_NAME = "summarize"  # prompts/summarize.md
 
-TIMEOUT_SECONDS = 180  # per LLM call timeout
+TIMEOUT_SECONDS = 120  # per LLM call timeout
 MAX_RETRIES = 3  # number of retry attempts on timeout/error
 MAX_WORKERS = 8  # max concurrent threads per chapter
 
@@ -71,7 +71,7 @@ def call_llm(client: OpenAI, model: str, system_prompt: str, user_content: str) 
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        temperature=0.3,
+        temperature=0,
         timeout=TIMEOUT_SECONDS,
     )
     return response.choices[0].message.content.strip()
@@ -172,7 +172,7 @@ def section_json_to_markdown(data: dict) -> str:
             fig_id = fig.get("id")
             fig_caption = fig.get("caption", "")
             if fig_id is not None:
-                path = f"images/image_{int(fig_id):04d}.jpeg"
+                path = f"image_{int(fig_id):04d}.png"
                 lines.append(f"![{fig_caption}]({path})")
                 lines.append("")
 
@@ -372,7 +372,12 @@ def process_chapter(
 
 def main():
     parser = argparse.ArgumentParser(description="Summarize book sections using LLM")
-    parser.add_argument("--book", required=True, help="Book folder name under books/")
+    parser.add_argument(
+        "--book",
+        required=False,
+        default=None,
+        help="Book folder name under outputs/. Default: run all books with content.json",
+    )
     parser.add_argument(
         "--chapter",
         type=int,
@@ -387,57 +392,94 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load book data
-    book_dir = Path(__file__).parent / "books" / args.book
-    content_path = book_dir / "content.json"
-    if not content_path.exists():
-        print(f"Error: {content_path} not found. Run convert_book.py first.")
+    root_dir = Path(__file__).parent / "outputs"
+    if not root_dir.exists():
+        print(f"Error: outputs directory not found: {root_dir}")
         sys.exit(1)
 
-    with open(content_path, "r", encoding="utf-8") as f:
-        book_data = json.load(f)
-
-    chapters = book_data["chapters"]
-    print(f"Book: {args.book}  ({len(chapters)} chapters)")
-
-    # Determine which chapters to process
-    if args.chapter:
-        selected = []
-        for idx in args.chapter:
-            if idx < 1 or idx > len(chapters):
-                print(
-                    f"Warning: chapter {idx} out of range (1-{len(chapters)}), skipping"
-                )
-                continue
-            selected.append((idx, chapters[idx - 1]))
+    if args.book:
+        book_dirs = [root_dir / args.book]
     else:
-        selected = [(i + 1, ch) for i, ch in enumerate(chapters)]
+        book_dirs = sorted([p for p in root_dir.iterdir() if p.is_dir()])
 
-    if not selected:
-        print("No chapters to process.")
-        sys.exit(0)
+    runnable = []
+    skipped = []
+    for book_dir in book_dirs:
+        content_path = book_dir / "content.json"
+        if content_path.exists():
+            runnable.append(book_dir)
+        else:
+            skipped.append(book_dir.name)
 
-    # Setup
-    book_name = book_dir.name
-    system_prompt = load_prompt(args.prompt).replace("{{BOOK_NAME}}", book_name)
+    if not runnable:
+        print("Error: No books with content.json found under outputs/")
+        sys.exit(1)
+
+    if not args.book:
+        print(
+            f"Found {len(runnable)} runnable books under outputs/ "
+            f"(skipped {len(skipped)} without content.json)."
+        )
+        for name in skipped:
+            print(f"  - Skipping {name}: missing outputs/{name}/content.json")
+
     client = build_client()
     model = os.environ.get("LLM_ID", "gpt-4o")
-    output_dir = book_dir / "outputs"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    failed_books = []
 
-    print(f"Model: {model}")
-    print(f"Output: {output_dir}")
-    print(f"Chapters to process: {[idx for idx, _ in selected]}")
-    print()
+    for book_dir in runnable:
+        content_path = book_dir / "content.json"
+        with open(content_path, "r", encoding="utf-8") as f:
+            book_data = json.load(f)
 
-    for chapter_idx, chapter in selected:
-        ch_name = chapter["name"]
-        n_sections = len(chapter["sections"])
-        print(f"Chapter {chapter_idx}: {ch_name} ({n_sections} sections)")
-        process_chapter(client, model, system_prompt, chapter, chapter_idx, output_dir)
+        chapters = book_data["chapters"]
+        print(f"\nBook: {book_dir.name}  ({len(chapters)} chapters)")
+
+        # Determine which chapters to process
+        if args.chapter:
+            selected = []
+            for idx in args.chapter:
+                if idx < 1 or idx > len(chapters):
+                    print(
+                        f"Warning: chapter {idx} out of range (1-{len(chapters)}), skipping"
+                    )
+                    continue
+                selected.append((idx, chapters[idx - 1]))
+        else:
+            selected = [(i + 1, ch) for i, ch in enumerate(chapters)]
+
+        if not selected:
+            print("No chapters to process.")
+            continue
+
+        system_prompt = load_prompt(args.prompt).replace("{{BOOK_NAME}}", book_dir.name)
+        output_dir = book_dir / "chapters"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"Model: {model}")
+        print(f"Output: {output_dir}")
+        print(f"Chapters to process: {[idx for idx, _ in selected]}")
         print()
 
+        try:
+            for chapter_idx, chapter in selected:
+                ch_name = chapter["name"]
+                n_sections = len(chapter["sections"])
+                print(f"Chapter {chapter_idx}: {ch_name} ({n_sections} sections)")
+                process_chapter(
+                    client, model, system_prompt, chapter, chapter_idx, output_dir
+                )
+                print()
+        except Exception as exc:
+            print(f"Error: failed processing book '{book_dir.name}': {exc}")
+            failed_books.append(book_dir.name)
+
     print("Done.")
+    if failed_books:
+        print("Failed books:")
+        for name in failed_books:
+            print(f"  - {name}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
