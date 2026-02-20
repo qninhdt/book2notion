@@ -1,6 +1,5 @@
+pymupdf
 openai
 tqdm
 python-dotenv
-beautifulsoup4
-PyPDF2
 notion-client

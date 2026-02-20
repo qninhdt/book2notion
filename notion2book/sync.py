@@ -6,43 +6,32 @@ Creates a hierarchical structure:
 
 Each chapter page renders the structured JSON output as rich Notion blocks.
 
-Usage:
-    python sync_to_notion.py [--force] [--book BOOK_NAME]
-
 Environment variables (in .env):
     NOTION_API_KEY   - Notion integration token
     NOTION_PAGE_ID   - Parent page ID for the books database
-    IMAGE_BASE_URL   - (Optional) Base URL prefix for hosted book images
 """
 
+import hashlib
+import json
 import os
 import re
-import sys
-import json
 import time
-import hashlib
-import argparse
 from pathlib import Path
-from urllib.parse import quote as url_quote
 
 from dotenv import load_dotenv
 from notion_client import Client
 from notion_client.errors import APIResponseError
 
-load_dotenv()
+from .project import OUTPUTS_ROOT, list_output_book_dirs
 
-NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID")
-IMAGE_BASE_URL = os.getenv("IMAGE_BASE_URL", "").rstrip("/")
-OUTPUTS_DIR = Path(__file__).parent / "outputs"
 BATCH_SIZE = 100
 
-notion: Client = None
+# Module-level client, initialized in run()
+notion: Client
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Notion API helpers
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ---------------------------------------------------------------------------
+# Notion API helpers
+# ---------------------------------------------------------------------------
 
 
 def api(fn, *a, **kw):
@@ -100,13 +89,27 @@ def find_page(ds_id, title):
     return r["results"][0]["id"] if r["results"] else None
 
 
+def normalize_page_id(pid):
+    if pid and pid.startswith("http"):
+        cleaned = pid.split("?")[0].split("#")[0]
+        match = re.search(r"([a-f0-9]{32})", cleaned.replace("-", ""))
+        if match:
+            h = match.group(1)
+            return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+    return pid
+
+
+# ---------------------------------------------------------------------------
+# Sync cache
+# ---------------------------------------------------------------------------
+
+
 def _file_hash(path):
     """SHA-1 of the raw file bytes."""
     return hashlib.sha1(path.read_bytes()).hexdigest()
 
 
 def _load_cache(out_dir):
-    """Load the local sync hash cache for a book's outputs directory."""
     cache_file = Path(out_dir) / ".sync_cache.json"
     if cache_file.exists():
         try:
@@ -121,24 +124,17 @@ def _save_cache(out_dir, cache):
     cache_file.write_text(json.dumps(cache, indent=2))
 
 
-def normalize_page_id(pid):
-    if pid and pid.startswith("http"):
-        cleaned = pid.split("?")[0].split("#")[0]
-        match = re.search(r"([a-f0-9]{32})", cleaned.replace("-", ""))
-        if match:
-            h = match.group(1)
-            return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
-    return pid
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Image upload
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ---------------------------------------------------------------------------
+# Image upload
+# ---------------------------------------------------------------------------
 
 _MIME = {
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".png": "image/png", ".gif": "image/gif",
-    ".webp": "image/webp", ".svg": "image/svg+xml",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
 }
 
 
@@ -165,9 +161,9 @@ def upload_image(filepath):
     return upload_id
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Rich-text primitives
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ---------------------------------------------------------------------------
+# Rich-text primitives
+# ---------------------------------------------------------------------------
 
 
 def _rt(content, bold=False, italic=False, code=False, color="default", link=None):
@@ -175,8 +171,12 @@ def _rt(content, bold=False, italic=False, code=False, color="default", link=Non
         "type": "text",
         "text": {"content": content},
         "annotations": {
-            "bold": bold, "italic": italic, "code": code,
-            "strikethrough": False, "underline": False, "color": color,
+            "bold": bold,
+            "italic": italic,
+            "code": code,
+            "strikethrough": False,
+            "underline": False,
+            "color": color,
         },
     }
     if link:
@@ -196,9 +196,9 @@ def _chunk(content, limit=2000, **kw):
     return out
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Inline markdown → rich_text[]
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ---------------------------------------------------------------------------
+# Inline markdown → rich_text[]
+# ---------------------------------------------------------------------------
 
 
 def parse_inline(text):
@@ -225,43 +225,68 @@ def parse_inline(text):
             flush()
             end = text.find("`", i + 1)
             if end < 0:
-                buf += c; i += 1; continue
+                buf += c
+                i += 1
+                continue
             result.extend(_chunk(text[i + 1 : end], code=True))
-            i = end + 1; continue
+            i = end + 1
+            continue
 
         if c == "$":
             if text[i : i + 2] == "$$":
                 end = text.find("$$", i + 2)
                 if end >= 0:
-                    flush(); result.append(_eq(text[i + 2 : end]))
-                    i = end + 2; continue
+                    flush()
+                    result.append(_eq(text[i + 2 : end]))
+                    i = end + 2
+                    continue
             end = text.find("$", i + 1)
             if end >= 0 and "\n" not in text[i + 1 : end] and end > i + 1:
-                flush(); result.append(_eq(text[i + 1 : end]))
-                i = end + 1; continue
-            buf += c; i += 1; continue
+                flush()
+                result.append(_eq(text[i + 1 : end]))
+                i = end + 1
+                continue
+            buf += c
+            i += 1
+            continue
 
         three = text[i : i + 3]
         two = text[i : i + 2]
 
         if three in ("***", "___"):
-            flush(); bold = not bold; italic = not italic; i += 3; continue
+            flush()
+            bold = not bold
+            italic = not italic
+            i += 3
+            continue
         if two in ("**", "__"):
-            flush(); bold = not bold; i += 2; continue
+            flush()
+            bold = not bold
+            i += 2
+            continue
         if c == "*":
-            flush(); italic = not italic; i += 1; continue
+            flush()
+            italic = not italic
+            i += 1
+            continue
         if c == "_":
             pa = i > 0 and text[i - 1].isalnum()
             na = i + 1 < n and text[i + 1].isalnum()
             if not (pa and na):
-                flush(); italic = not italic; i += 1; continue
+                flush()
+                italic = not italic
+                i += 1
+                continue
 
         if c == "[":
             m = re.match(r"\[([^\]]+)\]\(([^\)]+)\)", text[i:])
             if m:
                 flush()
-                result.extend(_chunk(m.group(1), bold=bold, italic=italic, link=m.group(2)))
-                i += m.end(); continue
+                result.extend(
+                    _chunk(m.group(1), bold=bold, italic=italic, link=m.group(2))
+                )
+                i += m.end()
+                continue
 
         buf += c
         i += 1
@@ -270,36 +295,128 @@ def parse_inline(text):
     return result or [_rt("")]
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Code-language normalisation
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ---------------------------------------------------------------------------
+# Code-language normalisation
+# ---------------------------------------------------------------------------
 
 _LANG_MAP = {
-    "cpp": "c++", "cc": "c++", "cxx": "c++", "c++": "c++",
-    "csharp": "c#", "cs": "c#",
-    "js": "javascript", "jsx": "javascript",
-    "ts": "typescript", "tsx": "typescript",
-    "py": "python", "python3": "python",
-    "rb": "ruby", "sh": "shell", "zsh": "shell", "bash": "bash",
-    "yml": "yaml", "md": "markdown", "dockerfile": "docker",
+    "cpp": "c++",
+    "cc": "c++",
+    "cxx": "c++",
+    "c++": "c++",
+    "csharp": "c#",
+    "cs": "c#",
+    "js": "javascript",
+    "jsx": "javascript",
+    "ts": "typescript",
+    "tsx": "typescript",
+    "py": "python",
+    "python3": "python",
+    "rb": "ruby",
+    "sh": "shell",
+    "zsh": "shell",
+    "bash": "bash",
+    "yml": "yaml",
+    "md": "markdown",
+    "dockerfile": "docker",
     "objc": "objective-c",
-    "txt": "plain text", "text": "plain text", "plaintext": "plain text",
+    "txt": "plain text",
+    "text": "plain text",
+    "plaintext": "plain text",
     "": "plain text",
 }
 
 _VALID_LANGS = {
-    "abap", "abc", "agda", "arduino", "ascii art", "assembly", "bash", "basic",
-    "bnf", "c", "c#", "c++", "clojure", "coffeescript", "coq", "css", "dart",
-    "dhall", "diff", "docker", "ebnf", "elixir", "elm", "erlang", "f#", "flow",
-    "fortran", "gherkin", "glsl", "go", "graphql", "groovy", "haskell", "hcl",
-    "html", "idris", "java", "javascript", "json", "julia", "kotlin", "latex",
-    "less", "lisp", "livescript", "llvm ir", "lua", "makefile", "markdown",
-    "markup", "matlab", "mathematica", "mermaid", "nix", "notion formula",
-    "objective-c", "ocaml", "pascal", "perl", "php", "plain text", "powershell",
-    "prolog", "protobuf", "purescript", "python", "r", "racket", "reason",
-    "ruby", "rust", "sass", "scala", "scheme", "scss", "shell", "smalltalk",
-    "solidity", "sql", "swift", "toml", "typescript", "vb.net", "verilog",
-    "vhdl", "visual basic", "webassembly", "xml", "yaml", "java/c/c++/c#",
+    "abap",
+    "abc",
+    "agda",
+    "arduino",
+    "ascii art",
+    "assembly",
+    "bash",
+    "basic",
+    "bnf",
+    "c",
+    "c#",
+    "c++",
+    "clojure",
+    "coffeescript",
+    "coq",
+    "css",
+    "dart",
+    "dhall",
+    "diff",
+    "docker",
+    "ebnf",
+    "elixir",
+    "elm",
+    "erlang",
+    "f#",
+    "flow",
+    "fortran",
+    "gherkin",
+    "glsl",
+    "go",
+    "graphql",
+    "groovy",
+    "haskell",
+    "hcl",
+    "html",
+    "idris",
+    "java",
+    "javascript",
+    "json",
+    "julia",
+    "kotlin",
+    "latex",
+    "less",
+    "lisp",
+    "livescript",
+    "llvm ir",
+    "lua",
+    "makefile",
+    "markdown",
+    "markup",
+    "matlab",
+    "mathematica",
+    "mermaid",
+    "nix",
+    "notion formula",
+    "objective-c",
+    "ocaml",
+    "pascal",
+    "perl",
+    "php",
+    "plain text",
+    "powershell",
+    "prolog",
+    "protobuf",
+    "purescript",
+    "python",
+    "r",
+    "racket",
+    "reason",
+    "ruby",
+    "rust",
+    "sass",
+    "scala",
+    "scheme",
+    "scss",
+    "shell",
+    "smalltalk",
+    "solidity",
+    "sql",
+    "swift",
+    "toml",
+    "typescript",
+    "vb.net",
+    "verilog",
+    "vhdl",
+    "visual basic",
+    "webassembly",
+    "xml",
+    "yaml",
+    "java/c/c++/c#",
 }
 
 
@@ -309,9 +426,9 @@ def _lang(s):
     return mapped if mapped in _VALID_LANGS else "plain text"
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Block-level markdown → Notion blocks
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ---------------------------------------------------------------------------
+# Block-level markdown → Notion blocks
+# ---------------------------------------------------------------------------
 
 
 def _is_table_row(line):
@@ -332,16 +449,18 @@ def _parse_table(lines, i):
         return i, []
     col_count = max(len(r) for r in rows)
     table_rows = []
-    for ri, row in enumerate(rows):
-        cells = []
-        for ci in range(col_count):
-            cell_text = row[ci] if ci < len(row) else ""
-            cells.append({"type": "table_cell", "table_cell": {
-                "rich_text": parse_inline(cell_text),
-            }})
-        table_rows.append({"type": "table_row", "table_row": {"cells": [
-            c["table_cell"]["rich_text"] for c in cells
-        ]}})
+    for row in rows:
+        table_rows.append(
+            {
+                "type": "table_row",
+                "table_row": {
+                    "cells": [
+                        parse_inline(row[ci] if ci < len(row) else "")
+                        for ci in range(col_count)
+                    ]
+                },
+            }
+        )
     block = {
         "type": "table",
         "table": {
@@ -379,45 +498,65 @@ def md_to_blocks(text, book_dir=None):
     while i < n:
         s = lines[i].strip()
         if not s:
-            i += 1; continue
+            i += 1
+            continue
 
         if s.startswith("$$"):
             if s == "$$":
-                parts = []; i += 1
+                parts = []
+                i += 1
                 while i < n and lines[i].strip() != "$$":
-                    parts.append(lines[i]); i += 1
-                if i < n: i += 1
+                    parts.append(lines[i])
+                    i += 1
+                if i < n:
+                    i += 1
                 expr = "\n".join(parts).strip()
             else:
                 expr = s[2:]
-                if expr.endswith("$$"): expr = expr[:-2]
-                expr = expr.strip(); i += 1
+                if expr.endswith("$$"):
+                    expr = expr[:-2]
+                expr = expr.strip()
+                i += 1
             blocks.append({"type": "equation", "equation": {"expression": expr}})
             continue
 
         if s.startswith("```"):
-            lg = s[3:].strip(); cl = []; i += 1
+            lg = s[3:].strip()
+            cl = []
+            i += 1
             while i < n and not lines[i].strip().startswith("```"):
-                cl.append(lines[i]); i += 1
-            if i < n: i += 1
-            blocks.append({"type": "code", "code": {
-                "rich_text": _chunk("\n".join(cl)), "language": _lang(lg),
-            }})
+                cl.append(lines[i])
+                i += 1
+            if i < n:
+                i += 1
+            blocks.append(
+                {
+                    "type": "code",
+                    "code": {
+                        "rich_text": _chunk("\n".join(cl)),
+                        "language": _lang(lg),
+                    },
+                }
+            )
             continue
 
         hm = re.match(r"^(#{1,3})\s+(.+)$", s)
         if hm:
             lv = f"heading_{min(len(hm.group(1)), 3)}"
             blocks.append({"type": lv, lv: {"rich_text": parse_inline(hm.group(2))}})
-            i += 1; continue
+            i += 1
+            continue
 
         if re.match(r"^---+$", s):
-            blocks.append({"type": "divider", "divider": {}}); i += 1; continue
+            blocks.append({"type": "divider", "divider": {}})
+            i += 1
+            continue
 
         im = re.match(r"^!\[([^\]]*)\]\(([^\)]+)\)", s)
         if im:
             blocks.append(_build_md_image(im.group(2), im.group(1), book_dir))
-            i += 1; continue
+            i += 1
+            continue
 
         if _is_table_row(s):
             i, tblocks = _parse_table(lines, i)
@@ -427,101 +566,100 @@ def md_to_blocks(text, book_dir=None):
         if s.startswith("> "):
             ql = []
             while i < n and lines[i].strip().startswith("> "):
-                ql.append(lines[i].strip()[2:]); i += 1
-            blocks.append({"type": "quote", "quote": {"rich_text": parse_inline("\n".join(ql))}})
+                ql.append(lines[i].strip()[2:])
+                i += 1
+            blocks.append(
+                {"type": "quote", "quote": {"rich_text": parse_inline("\n".join(ql))}}
+            )
             continue
 
         if re.match(r"^[-*]\s", s):
-            i, lb = _parse_list(lines, i, bullet=True); blocks.extend(lb); continue
+            i, lb = _parse_list(lines, i, bullet=True)
+            blocks.extend(lb)
+            continue
 
         if re.match(r"^\d+\.\s", s):
-            i, lb = _parse_list(lines, i, bullet=False); blocks.extend(lb); continue
+            i, lb = _parse_list(lines, i, bullet=False)
+            blocks.extend(lb)
+            continue
 
-        pl = [s]; i += 1
+        pl = [s]
+        i += 1
         while i < n and lines[i].strip() and not _is_block_start(lines[i]):
-            pl.append(lines[i].strip()); i += 1
-        blocks.append({"type": "paragraph", "paragraph": {"rich_text": parse_inline(" ".join(pl))}})
+            pl.append(lines[i].strip())
+            i += 1
+        blocks.append(
+            {
+                "type": "paragraph",
+                "paragraph": {"rich_text": parse_inline(" ".join(pl))},
+            }
+        )
 
     return blocks
 
 
 def _resolve_local_image(image_ref, book_dir):
-    """Resolve a markdown image reference to a local file if present."""
+    """Resolve a markdown image reference from outputs/{book}/images."""
     if not image_ref:
         return None
     if re.match(r"^https?://", image_ref):
         return None
 
     rel = image_ref.lstrip("./")
-    candidates = [
-        book_dir / "chapters" / rel,
-        book_dir / rel,
-        book_dir / "hybrid_auto" / "images" / rel,
-        book_dir / "images" / rel,
-    ]
-    for p in candidates:
-        if p.exists() and p.is_file():
-            return p
+    if rel.startswith("images/"):
+        rel = rel[len("images/") :]
 
-    # Compatibility mapping between image_XXXX and figure_XXXX naming.
-    m = re.match(
-        r"^(?:images/)?(?P<prefix>image|figure)_(?P<num>\d{4})\.(?P<ext>png|jpe?g|gif|webp)$",
-        rel,
-        re.IGNORECASE,
-    )
-    if m:
-        num = m.group("num")
-        prefixes = ("figure", "image")
-        exts = (".png", ".jpeg", ".jpg", ".gif", ".webp")
-        for pref in prefixes:
-            for ext in exts:
-                for p in (
-                    book_dir / "chapters" / f"{pref}_{num}{ext}",
-                    book_dir / f"{pref}_{num}{ext}",
-                    book_dir / "images" / f"{pref}_{num}{ext}",
-                    book_dir / "hybrid_auto" / "images" / f"{pref}_{num}{ext}",
-                ):
-                    if p.exists() and p.is_file():
-                        return p
+    primary = book_dir / "images" / rel
+    if primary.exists() and primary.is_file():
+        return primary
+
+    # Allow extension mismatch in markdown (e.g. figure_0001.png vs .jpg on disk).
+    stem = Path(rel).stem
+    if stem.startswith("figure_"):
+        for ext in (".png", ".jpeg", ".jpg", ".gif", ".webp"):
+            candidate = book_dir / "images" / f"{stem}{ext}"
+            if candidate.exists() and candidate.is_file():
+                return candidate
+
     return None
 
 
 def _build_md_image(path, caption="", book_dir=None):
     caption_rt = parse_inline(caption)[:25] if caption else []
 
-    # Upload local image when possible.
     if book_dir is not None:
         local = _resolve_local_image(path, book_dir)
         if local is not None:
             try:
                 uid = upload_image(local)
-                return {"type": "image", "image": {
-                    "type": "file_upload", "file_upload": {"id": uid},
-                    "caption": caption_rt,
-                }}
+                return {
+                    "type": "image",
+                    "image": {
+                        "type": "file_upload",
+                        "file_upload": {"id": uid},
+                        "caption": caption_rt,
+                    },
+                }
             except Exception as e:
                 print(f"      [warn] Upload failed {local.name}: {e}")
 
-    # If markdown path is already a URL, use it directly.
     if re.match(r"^https?://", path):
-        return {"type": "image", "image": {
-            "type": "external", "external": {"url": path},
-            "caption": caption_rt,
-        }}
+        return {
+            "type": "image",
+            "image": {
+                "type": "external",
+                "external": {"url": path},
+                "caption": caption_rt,
+            },
+        }
 
-    # Build external URL from configured base if available.
-    if IMAGE_BASE_URL and book_dir is not None:
-        url = f"{IMAGE_BASE_URL}/{url_quote(book_dir.name)}/{url_quote(path)}"
-        return {"type": "image", "image": {
-            "type": "external", "external": {"url": url},
-            "caption": caption_rt,
-        }}
-
-    # Last resort: keep raw path as external URL (legacy behavior).
-    return {"type": "image", "image": {
-        "type": "external", "external": {"url": path},
-        "caption": caption_rt,
-    }}
+    return {
+        "type": "callout",
+        "callout": {
+            "rich_text": [_rt(f"Missing image: {path}", italic=True)],
+            "icon": {"emoji": "\U0001f5bc\ufe0f"},
+        },
+    }
 
 
 def _parse_list(lines, i, bullet=True):
@@ -532,21 +670,27 @@ def _parse_list(lines, i, bullet=True):
     n = len(lines)
 
     while i < n:
-        raw = lines[i]; s = raw.strip()
+        raw = lines[i]
+        s = raw.strip()
         indent = len(raw) - len(raw.lstrip())
         if not s:
             if i + 1 < n and _is_list_continuation(lines[i + 1], pat):
-                i += 1; continue
+                i += 1
+                continue
             break
         if indent < 2 and re.match(pat, s):
-            items.append({"t": re.sub(strip_re, "", s, count=1), "ch": []}); i += 1
+            items.append({"t": re.sub(strip_re, "", s, count=1), "ch": []})
+            i += 1
         elif indent >= 2 and items:
             if re.match(r"^[-*]\s", s):
-                items[-1]["ch"].append(("b", re.sub(r"^[-*]\s+", "", s, count=1))); i += 1
+                items[-1]["ch"].append(("b", re.sub(r"^[-*]\s+", "", s, count=1)))
+                i += 1
             elif re.match(r"^\d+\.\s", s):
-                items[-1]["ch"].append(("n", re.sub(r"^\d+\.\s+", "", s, count=1))); i += 1
+                items[-1]["ch"].append(("n", re.sub(r"^\d+\.\s+", "", s, count=1)))
+                i += 1
             else:
-                items[-1]["t"] += " " + s; i += 1
+                items[-1]["t"] += " " + s
+                i += 1
         else:
             break
 
@@ -557,7 +701,9 @@ def _parse_list(lines, i, bullet=True):
             children = []
             for ct, ctxt in it["ch"]:
                 ctype = "bulleted_list_item" if ct == "b" else "numbered_list_item"
-                children.append({"type": ctype, ctype: {"rich_text": parse_inline(ctxt)}})
+                children.append(
+                    {"type": ctype, ctype: {"rich_text": parse_inline(ctxt)}}
+                )
             b[btype]["children"] = children
         blocks.append(b)
     return i, blocks
@@ -583,45 +729,55 @@ def _flatten_children(blocks):
     return out
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Section / chapter → Notion blocks
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ---------------------------------------------------------------------------
+# Section / chapter → Notion blocks
+# ---------------------------------------------------------------------------
 
 
 def build_section(section, sec_idx, book_dir):
     blocks = []
 
-    # ── Section heading (H1) — prefix: "1." ──
-    blocks.append({
-        "type": "heading_1",
-        "heading_1": {"rich_text": [_rt(f"{sec_idx}. {section['name']}")]},
-    })
+    blocks.append(
+        {
+            "type": "heading_1",
+            "heading_1": {"rich_text": [_rt(f"{sec_idx}. {section['name']}")]},
+        }
+    )
 
-    # ── One-sentence summary ──
     if section.get("summary"):
-        blocks.append({
-            "type": "paragraph",
-            "paragraph": {"rich_text": parse_inline(section["summary"]), "color": "gray"},
-        })
+        blocks.append(
+            {
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": parse_inline(section["summary"]),
+                    "color": "gray",
+                },
+            }
+        )
 
-    # ── Subsections — prefix: "1.1" ──
     for si, sub in enumerate(section.get("subsections") or [], 1):
-        blocks.append({
-            "type": "heading_2",
-            "heading_2": {"rich_text": [_rt(f"{sec_idx}.{si} {sub['name']}")]},
-        })
+        blocks.append(
+            {
+                "type": "heading_2",
+                "heading_2": {"rich_text": [_rt(f"{sec_idx}.{si} {sub['name']}")]},
+            }
+        )
         blocks.extend(md_to_blocks(sub.get("content", ""), book_dir))
         for fig in sub.get("figures") or []:
             blocks.append(_build_figure(fig, book_dir))
 
-    # ── Standalone code block ──
     if section.get("code") and section["code"].get("content"):
         c = section["code"]
-        blocks.append({"type": "code", "code": {
-            "rich_text": _chunk(c["content"]), "language": _lang(c.get("lang", "")),
-        }})
+        blocks.append(
+            {
+                "type": "code",
+                "code": {
+                    "rich_text": _chunk(c["content"]),
+                    "language": _lang(c.get("lang", "")),
+                },
+            }
+        )
 
-    # ── Interview section (collapsible toggle) ──
     if section.get("interview"):
         children = []
         for qa in section["interview"]:
@@ -635,73 +791,115 @@ def build_section(section, sec_idx, book_dir):
             # quote and answer toggle are siblings (Notion disallows children on a
             # toggle that is itself inside quote.children — 3-level nesting limit)
             children.append({"type": "quote", "quote": {"rich_text": q_rt}})
-            children.append({
+            children.append(
+                {
+                    "type": "toggle",
+                    "toggle": {
+                        "rich_text": [_rt("Answer", bold=True)],
+                        "children": [
+                            {
+                                "type": "paragraph",
+                                "paragraph": {
+                                    "rich_text": parse_inline(answer),
+                                },
+                            }
+                        ],
+                    },
+                }
+            )
+        blocks.append({"type": "paragraph", "paragraph": {"rich_text": [_rt("")]}})
+        blocks.append(
+            {
                 "type": "toggle",
                 "toggle": {
-                    "rich_text": [_rt("Answer", bold=True)],
-                    "children": [{"type": "paragraph", "paragraph": {
-                        "rich_text": parse_inline(answer),
-                    }}],
+                    "rich_text": [_rt("Interview", bold=True, italic=True)],
+                    "color": "blue_background",
+                    "children": children,
                 },
-            })
-        blocks.append({"type": "paragraph", "paragraph": {"rich_text": [_rt("")]}})
-        blocks.append({
-            "type": "toggle",
-            "toggle": {
-                "rich_text": [_rt("Interview", bold=True, italic=True)],
-                "color": "blue_background",
-                "children": children,
-            },
-        })
+            }
+        )
 
-    # ── More section (collapsible toggle) ──
     if section.get("more"):
         children = []
         for m in section["more"]:
-            children.append({"type": "heading_3", "heading_3": {
-                "rich_text": [_rt(m["name"], bold=True)],
-            }})
+            children.append(
+                {
+                    "type": "heading_3",
+                    "heading_3": {
+                        "rich_text": [_rt(m["name"], bold=True)],
+                    },
+                }
+            )
             children.extend(
                 _flatten_children(md_to_blocks(m.get("content", ""), book_dir))
             )
-        blocks.append({
-            "type": "toggle",
-            "toggle": {
-                "rich_text": [_rt("More", bold=True, italic=True)],
-                "color": "yellow_background",
-                "children": children,
-            },
-        })
+        blocks.append(
+            {
+                "type": "toggle",
+                "toggle": {
+                    "rich_text": [_rt("More", bold=True, italic=True)],
+                    "color": "yellow_background",
+                    "children": children,
+                },
+            }
+        )
 
-    # ── Editorial section (collapsible toggle) ──
     retained = section.get("retained") or []
     omitted = section.get("omitted") or []
     if retained or omitted:
         children = []
         if retained:
-            children.append({"type": "paragraph", "paragraph": {
-                "rich_text": [_rt("Retained", bold=True)],
-            }})
+            children.append(
+                {
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [_rt("Retained", bold=True)],
+                    },
+                }
+            )
             for item in retained:
-                children.append({"type": "bulleted_list_item", "bulleted_list_item": {
-                    "rich_text": [_rt(item["name"], bold=True), _rt(f" — {item['reason']}")],
-                }})
+                children.append(
+                    {
+                        "type": "bulleted_list_item",
+                        "bulleted_list_item": {
+                            "rich_text": [
+                                _rt(item["name"], bold=True),
+                                _rt(f" — {item['reason']}"),
+                            ],
+                        },
+                    }
+                )
         if omitted:
-            children.append({"type": "paragraph", "paragraph": {
-                "rich_text": [_rt("Omitted", bold=True)],
-            }})
+            children.append(
+                {
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [_rt("Omitted", bold=True)],
+                    },
+                }
+            )
             for item in omitted:
-                children.append({"type": "bulleted_list_item", "bulleted_list_item": {
-                    "rich_text": [_rt(item["name"], bold=True), _rt(f" — {item['reason']}")],
-                }})
-        blocks.append({
-            "type": "toggle",
-            "toggle": {
-                "rich_text": [_rt("Editorial", bold=True, italic=True)],
-                "color": "gray_background",
-                "children": children,
-            },
-        })
+                children.append(
+                    {
+                        "type": "bulleted_list_item",
+                        "bulleted_list_item": {
+                            "rich_text": [
+                                _rt(item["name"], bold=True),
+                                _rt(f" — {item['reason']}"),
+                            ],
+                        },
+                    }
+                )
+        blocks.append(
+            {
+                "type": "toggle",
+                "toggle": {
+                    "rich_text": [_rt("Editorial", bold=True, italic=True)],
+                    "color": "gray_background",
+                    "children": children,
+                },
+            }
+        )
 
     blocks.append({"type": "divider", "divider": {}})
     return blocks
@@ -712,44 +910,36 @@ def _build_figure(fig, book_dir):
     fid = fig.get("id")
     caption_rt = parse_inline(caption)[:25] if caption else []
 
-    # Try local image upload
     if fid is not None and book_dir is not None:
         for ext in (".png", ".jpeg", ".jpg", ".gif", ".webp"):
-            for pref in ("figure", "image"):
-                for img_path in (
-                    book_dir / "chapters" / f"{pref}_{fid:04d}{ext}",
-                    book_dir / f"{pref}_{fid:04d}{ext}",
-                    book_dir / "hybrid_auto" / "images" / f"{pref}_{fid:04d}{ext}",
-                    book_dir / "images" / f"{pref}_{fid:04d}{ext}",
-                ):
-                    if img_path.exists():
-                        try:
-                            uid = upload_image(img_path)
-                            return {"type": "image", "image": {
-                                "type": "file_upload", "file_upload": {"id": uid},
-                                "caption": caption_rt,
-                            }}
-                        except Exception as e:
-                            print(f"      [warn] Upload failed {img_path.name}: {e}")
-                        break
+            img_path = book_dir / "images" / f"figure_{fid:04d}{ext}"
+            if img_path.exists():
+                try:
+                    uid = upload_image(img_path)
+                    return {
+                        "type": "image",
+                        "image": {
+                            "type": "file_upload",
+                            "file_upload": {"id": uid},
+                            "caption": caption_rt,
+                        },
+                    }
+                except Exception as e:
+                    print(f"      [warn] Upload failed {img_path.name}: {e}")
+                break
 
-    # Fallback: external URL
-    if IMAGE_BASE_URL and fid is not None:
-        url = f"{IMAGE_BASE_URL}/{url_quote(book_dir.name)}/figure_{fid:04d}.png"
-        return {"type": "image", "image": {
-            "type": "external", "external": {"url": url}, "caption": caption_rt,
-        }}
-
-    # Fallback: callout with caption text
     parts = [_rt("Figure: ", bold=True, italic=True)]
     if caption:
         parts.extend(_chunk(caption[:1800], italic=True))
-    return {"type": "callout", "callout": {"rich_text": parts, "icon": {"emoji": "\U0001f5bc\ufe0f"}}}
+    return {
+        "type": "callout",
+        "callout": {"rich_text": parts, "icon": {"emoji": "\U0001f5bc\ufe0f"}},
+    }
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Database management
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ---------------------------------------------------------------------------
+# Database management
+# ---------------------------------------------------------------------------
 
 
 def get_or_create_books_db(parent_id):
@@ -763,7 +953,9 @@ def get_or_create_books_db(parent_id):
                 return db_id, get_data_source_id(db_id)
 
     db = api(
-        notion.request, path="databases", method="POST",
+        notion.request,
+        path="databases",
+        method="POST",
         body={
             "parent": {"type": "page_id", "page_id": parent_id},
             "title": [{"type": "text", "text": {"content": "Books"}}],
@@ -784,7 +976,9 @@ def get_or_create_chapters_db(book_page_id):
             return db_id, get_data_source_id(db_id)
 
     db = api(
-        notion.request, path="databases", method="POST",
+        notion.request,
+        path="databases",
+        method="POST",
         body={
             "parent": {"type": "page_id", "page_id": book_page_id},
             "title": [{"type": "text", "text": {"content": "Chapters"}}],
@@ -800,9 +994,9 @@ def get_or_create_chapters_db(book_page_id):
     return db["id"], db["data_sources"][0]["id"]
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Sync logic
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ---------------------------------------------------------------------------
+# Sync logic
+# ---------------------------------------------------------------------------
 
 
 def _ch_sort_key(path):
@@ -848,10 +1042,6 @@ def sync_book(books_ds_id, book_dir):
     name = book_dir.name
     chapters_dir = book_dir / "chapters"
     if not chapters_dir.exists():
-        # Backward compatibility for old layout
-        legacy_out = book_dir / "outputs"
-        chapters_dir = legacy_out if legacy_out.exists() else None
-    if chapters_dir is None:
         return
 
     jsons = sorted(
@@ -886,30 +1076,36 @@ def sync_book(books_ds_id, book_dir):
     _save_cache(chapters_dir, cache)
 
 
-def main():
+def run(book=None):
     global notion
 
-    parser = argparse.ArgumentParser(description="Sync book notes to Notion")
-    parser.add_argument("--book", help="Sync only this book (folder name)")
-    args = parser.parse_args()
+    load_dotenv()
 
-    if not NOTION_API_KEY or not NOTION_PAGE_ID:
+    api_key = os.getenv("NOTION_API_KEY")
+    page_id_raw = os.getenv("NOTION_PAGE_ID")
+
+    if not api_key or not page_id_raw:
         print("Error: Set NOTION_API_KEY and NOTION_PAGE_ID in .env")
-        sys.exit(1)
+        return 1
+    if not OUTPUTS_ROOT.exists():
+        print(f"Error: outputs directory not found: {OUTPUTS_ROOT}")
+        return 1
 
-    page_id = normalize_page_id(NOTION_PAGE_ID)
-    notion = Client(auth=NOTION_API_KEY)
+    page_id = normalize_page_id(page_id_raw)
+    notion = Client(auth=api_key)
 
     print("Connecting to Notion...")
     _, books_ds_id = get_or_create_books_db(page_id)
     print(f"Books database ready")
 
-    for d in sorted(OUTPUTS_DIR.iterdir()):
-        if d.is_dir() and (not args.book or d.name == args.book):
+    matched = 0
+    for d in list_output_book_dirs(book):
+        if d.is_dir():
+            matched += 1
             sync_book(books_ds_id, d)
+    if book and matched == 0:
+        print(f"Error: book not found under outputs/: {book}")
+        return 1
 
     print("\nSync complete!")
-
-
-if __name__ == "__main__":
-    main()
+    return 0

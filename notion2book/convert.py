@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Convert book to JSON format using:
+"""Convert book to JSON format using:
 - TOC from books/{name}.pdf
 - OCR data from outputs/{name}/hybrid_auto/{name}_content_list_v2.json
 
@@ -10,11 +9,12 @@ to OCR title elements using soft matching constrained by expected page numbers.
 import json
 import re
 import shutil
-import sys
 from difflib import SequenceMatcher
 from pathlib import Path
 
 import fitz  # pymupdf
+
+from .project import BOOKS_ROOT, OUTPUTS_ROOT, list_output_book_dirs
 
 EXCLUDE_PATTERNS = [
     r"key\s+terms",
@@ -133,7 +133,9 @@ def extract_toc_from_pdf(pdf_path):
                 chapter_name = ch_match2.group(2).strip()
             else:
                 ch_match3 = re.match(r"^(\d+)\s+(.+)$", title)
-                chapter_name = ch_match3.group(2).strip() if ch_match3 else title.strip()
+                chapter_name = (
+                    ch_match3.group(2).strip() if ch_match3 else title.strip()
+                )
 
         # Collect sections between this chapter and the next TOC peer.
         # Section depth is relative to each chapter entry (handles mixed TOC levels).
@@ -149,24 +151,32 @@ def extract_toc_from_pdf(pdf_path):
         for j in range(ci + 1, next_ci):
             s_level, s_title, s_page = normalized_toc[j]
             if s_level == section_level:
-                sections.append({
-                    "name": s_title.strip(),
-                    "page": s_page - 1,
-                })
+                sections.append(
+                    {
+                        "name": s_title.strip(),
+                        "page": s_page - 1,
+                    }
+                )
 
         if not sections:
             # Fallback for chapter-only TOCs.
-            sections.append({
+            sections.append(
+                {
+                    "name": chapter_name,
+                    "page": page_0indexed,
+                }
+            )
+
+        chapters.append(
+            {
                 "name": chapter_name,
                 "page": page_0indexed,
-            })
-
-        chapters.append({
-            "name": chapter_name,
-            "page": page_0indexed,
-            "end_page": normalized_toc[next_ci][2] - 1 if next_ci < len(normalized_toc) else None,
-            "sections": sections,
-        })
+                "end_page": normalized_toc[next_ci][2] - 1
+                if next_ci < len(normalized_toc)
+                else None,
+                "sections": sections,
+            }
+        )
 
     return {"chapters": chapters}
 
@@ -199,9 +209,7 @@ def load_ocr_elements(ocr_path):
     for page_idx, page in enumerate(pages):
         for elem_idx, elem in enumerate(page):
             if elem["type"] == "title":
-                text = _get_text_from_inline(
-                    elem["content"].get("title_content", [])
-                )
+                text = _get_text_from_inline(elem["content"].get("title_content", []))
                 if text:
                     flat_titles.append(
                         {
@@ -232,7 +240,11 @@ def _rewrite_and_copy_images_in_chapters(chapters, ocr_path):
         nonlocal copied, missing
         alt = match.group(1)
         src_rel = match.group(2).strip()
-        if not src_rel or src_rel.startswith("http://") or src_rel.startswith("https://"):
+        if (
+            not src_rel
+            or src_rel.startswith("http://")
+            or src_rel.startswith("https://")
+        ):
             return match.group(0)
 
         if src_rel in path_map:
@@ -279,7 +291,7 @@ def _normalize_for_match(text):
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"^[•\-]\s+", "", text)
     # Strip surrounding quotes (OCR sometimes wraps headings in quotes)
-    text = text.strip('"').strip('"').strip('"').strip("'")
+    text = text.strip('"').strip("\u201c").strip("\u201d").strip("'")
     return text
 
 
@@ -295,7 +307,12 @@ def _match_score(toc_title, ocr_title):
 
 
 def _find_best_title_near_page(
-    toc_name, flat_titles, expected_page, search_after_idx=-1, page_tolerance=5, threshold=0.70
+    toc_name,
+    flat_titles,
+    expected_page,
+    search_after_idx=-1,
+    page_tolerance=5,
+    threshold=0.70,
 ):
     """Find the best matching OCR title near the expected page.
     Search constraints:
@@ -324,12 +341,14 @@ def _find_best_title_near_page(
         page_dist = abs(t["page_idx"] - expected_page)
 
         # Prefer: higher score → closer page → later element (last on page)
-        if (score > best_score) or (
-            score == best_score and page_dist < best_page_dist
-        ) or (
-            score == best_score
-            and page_dist == best_page_dist
-            and t["flat_idx"] > best_idx
+        if (
+            (score > best_score)
+            or (score == best_score and page_dist < best_page_dist)
+            or (
+                score == best_score
+                and page_dist == best_page_dist
+                and t["flat_idx"] > best_idx
+            )
         ):
             best_idx = t["flat_idx"]
             best_score = score
@@ -529,7 +548,9 @@ def parse_ocr_with_toc(ocr_path, toc_result):
             )
 
     # Match each section sequentially (including excluded ones for boundary tracking)
-    matched_sections = []  # {ch_idx, name, flat_title_idx, page_idx, elem_idx, excluded}
+    matched_sections = (
+        []
+    )  # {ch_idx, name, flat_title_idx, page_idx, elem_idx, excluded}
     prev_matched_flat_idx = -1
 
     for sec_info in all_sections:
@@ -636,8 +657,8 @@ def _normalize_book_name(book_input):
 
 
 def _resolve_input_paths(name):
-    pdf_path = Path("books") / f"{name}.pdf"
-    ocr_path = Path("outputs") / name / "hybrid_auto" / f"{name}_content_list_v2.json"
+    pdf_path = BOOKS_ROOT / f"{name}.pdf"
+    ocr_path = OUTPUTS_ROOT / name / "hybrid_auto" / f"{name}_content_list_v2.json"
     return pdf_path, ocr_path
 
 
@@ -676,7 +697,7 @@ def convert_book(book_name):
     print("\n\n5. Creating JSON output...")
     output_data = {"chapters": chapters}
 
-    output_path = Path("outputs") / name / "content.json"
+    output_path = OUTPUTS_ROOT / name / "content.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2, ensure_ascii=False)
@@ -692,67 +713,63 @@ def convert_book(book_name):
     return True
 
 
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        ok = convert_book(sys.argv[1])
-        sys.exit(0 if ok else 1)
-    else:
-        output_root = Path("outputs")
-        if not output_root.exists():
-            print("Error: outputs directory not found")
-            sys.exit(1)
+def _discover_books():
+    if not OUTPUTS_ROOT.exists():
+        print(f"Error: outputs directory not found: {OUTPUTS_ROOT}")
+        return [], []
 
-        book_dirs = sorted([p for p in output_root.iterdir() if p.is_dir()])
-        if not book_dirs:
-            print("Error: No books found under outputs/")
-            sys.exit(1)
+    book_dirs = list_output_book_dirs()
+    runnable = []
+    skipped = []
+    for book_dir in book_dirs:
+        pdf_path, ocr_path = _resolve_input_paths(book_dir.name)
+        missing = []
+        if not pdf_path.exists():
+            missing.append(str(pdf_path))
+        if not ocr_path.exists():
+            missing.append(str(ocr_path))
+        if missing:
+            skipped.append((book_dir.name, missing))
+        else:
+            runnable.append(book_dir.name)
+    return runnable, skipped
 
-        runnable_books = []
-        skipped_books = []
-        for book_dir in book_dirs:
-            pdf_path, ocr_path = _resolve_input_paths(book_dir.name)
-            missing = []
-            if not pdf_path.exists():
-                missing.append(str(pdf_path))
-            if not ocr_path.exists():
-                missing.append(str(ocr_path))
-            if missing:
-                skipped_books.append((book_dir.name, missing))
-            else:
-                runnable_books.append(book_dir.name)
 
-        if not runnable_books:
-            print("Error: No books with complete inputs found.")
-            sys.exit(1)
+def run(book=None):
+    if book:
+        return 0 if convert_book(book) else 1
 
-        print(
-            f"Found {len(runnable_books)} runnable books under outputs/ "
-            f"(skipped {len(skipped_books)} with missing inputs)."
-        )
-        for book_name, missing in skipped_books:
-            print(f"Skipping {book_name}:")
-            for item in missing:
-                print(f"  - missing {item}")
+    runnable_books, skipped_books = _discover_books()
+    if not runnable_books:
+        print("Error: No books with complete inputs found.")
+        return 1
 
-        failed_books = []
-        for book_dir in book_dirs:
-            if book_dir.name not in runnable_books:
-                continue
-            try:
-                ok = convert_book(book_dir.name)
-            except Exception as exc:
-                print(f"Error: Unexpected failure for {book_dir.name}: {exc}")
-                ok = False
+    print(
+        f"Found {len(runnable_books)} runnable books under outputs/ "
+        f"(skipped {len(skipped_books)} with missing inputs)."
+    )
+    for book_name, missing in skipped_books:
+        print(f"Skipping {book_name}:")
+        for item in missing:
+            print(f"  - missing {item}")
 
-            if not ok:
-                failed_books.append(book_dir.name)
+    failed_books = []
+    for name in runnable_books:
+        try:
+            ok = convert_book(name)
+        except Exception as exc:
+            print(f"Error: Unexpected failure for {name}: {exc}")
+            ok = False
+        if not ok:
+            failed_books.append(name)
 
-        print(
-            f"\nRun summary: success={len(runnable_books) - len(failed_books)}, "
-            f"failed={len(failed_books)}, skipped={len(skipped_books)}"
-        )
-        if failed_books:
-            print("Failed books:")
-            for name in failed_books:
-                print(f"  - {name}")
-            sys.exit(1)
+    print(
+        f"\nRun summary: success={len(runnable_books) - len(failed_books)}, "
+        f"failed={len(failed_books)}, skipped={len(skipped_books)}"
+    )
+    if failed_books:
+        print("Failed books:")
+        for name in failed_books:
+            print(f"  - {name}")
+        return 1
+    return 0
