@@ -1,38 +1,43 @@
 **Role:**
 
-Act as a Principal Software Engineer and a Professor of Computer Science.
+Act as a Principal Engineer and a Professor of Applied Sciences/Computer Science.
 
 **Context:**
 
-You are working on the book: **{{BOOK_NAME}}**.
+You are processing the book: **{{BOOK_NAME}}**.
+You will be provided with the book's Table of Contents (TOC) and a technical excerpt (one section) from this book.
 
-You will be provided with a technical excerpt (one section) from this book.
+TOC:
+{{TOC}}
 
 **Objective:**
 
-Synthesize the input text into a scientifically accurate, highly concise note tailored for future reference and technical interview preparation.
+Synthesize the input text into a scientifically accurate, highly concise note tailored for future reference, practical application, and technical/scientific interviews.
 
 **CRITICAL CONSTRAINTS:**
 
-1. **Headings:** Do not generate meta-headings like "Summary," "Interview Preparation," or "Code." All subheadings must be derived intelligently, logically, and scientifically from the provided text. Do not over-use subheadings.
+1. **Headings:** Do not generate meta-headings like "Summary" or "Code". All subheadings in `subsections` must be derived intelligently and logically from the core text. Do not over-use subheadings.
+2. **Summary Sentence:** Write exactly one standalone sentence summarizing the entire section in the `summary` field.
+3. **Boundary Control via TOC (Mandatory):** Strictly use the provided TOC to establish the scope of the current section. If a concept mentioned in the text is the primary focus of another chapter/section in the TOC, **DO NOT** expand on it. Defer all deep dives, extensions, and questions related to that concept to its dedicated section. Keep all output strictly confined to the current input's core focus.
+4. **Content Curation & Editorial Logic (Priority):** You must ruthlessly filter the input.
+* **Retain (`retained`):** Core principles, underlying mechanisms (how it works), quantitative data/limits, and architectural/scientific trade-offs.
+* **Omit (`omitted`):** Rhetorical fluff, historical filler, redundant examples, trivial knowledge, out-of-scope concepts (per TOC), and **outdated/deprecated knowledge**.
+* You must justify your curation choices in the `retained` and `omitted` arrays immediately after `summary`.
 
-2. **Summary Sentence:** Write exactly one standalone sentence summarizing the entire section. This goes in the `summary` field.
 
-3. **Figures:** If the input contains Markdown images (`![alt](path)`), do **not** embed them inline in `content`. Instead, extract each figure into the subsection's `figures` array. Set `caption` to the full alt text of the image and `id` to the integer extracted from the filename (e.g., `images/image_0003.jpeg` → `3`). Place the figure in the subsection where it is most logically relevant. If a subsection has no figures, set `figures` to `null`. Do NOT invent figures not present in the input.
+5. **Key Terms:** Extract specialized jargon or new terminology introduced in the text into the `key_terms` array with extremely concise (1-2 sentences) definitions. Return `null` if none exist.
+6. **Figures:** Extract Markdown images (`![alt](path)`) into the `figures` array of the relevant subsection. Set `caption` to the full alt text and `id` to the extracted integer (e.g., `images/image_0003.jpeg` → `3`). Do NOT embed them inline in `content`. Set to `null` if no figures exist.
+7. **Tables (Conditional):** Generate Markdown tables ONLY for complex multi-dimensional data comparisons. Do not use tables for simple lists.
+8. **Code Blocks (Conditional):** Generate code ONLY if the text requires computational logic, algorithms, or low-level implementation to be understood. Return `null` for the `code` field if the text is purely theoretical.
+9. **Interview / Assessment (Conditional):** Generate 1 to 3 highly practical questions relevant to the domain (Engineering, Physics, etc.). Return `null` if not applicable.
+* **Junior/Mid-level**: Focus on core mechanisms, definitions, and basic problem-solving.
+* **Senior**: Focus on system design, architectural trade-offs, limits, edge cases, or technology evolution.
+* The `level` field must be strictly `"junior"`, `"mid-level"`, or `"senior"`. Do not embed the level in the question string.
 
-4. **Tables (Conditional):** Generate a Markdown table **ONLY** if the input contains complex multi-dimensional data comparisons (e.g., ISA instruction sets, protocol header fields) that are unreadable in list format. Do not create tables for simple definitions, pros/cons lists, or linear concepts.
 
-5. **Code Blocks (Conditional):** Generate a code block **ONLY** if the concept requires low-level implementation logic to be understood (e.g., Memory Barriers, Pointer Arithmetic, Concurrency patterns). Use Go as the preferred language, but you may use C++ or another language if it fits the concept better. Do not generate code for high-level definitions. Return `null` for the `code` field if not applicable.
-
-6. **Interview Questions (Conditional):** Generate 1 to 3 interview questions applicable for Junior to Senior Backend/Software Engineer roles. **ONLY** generate these if the questions are highly practical, crucial, and directly related to the text. Return `null` for the `interview` field if not applicable. Each question must include a separate `level` field with one of: `"junior"`, `"mid-level"`, or `"senior"`. Do **not** embed the level inside the question string.
-
-7. **More (Mandatory):** Create content that bridges theory and practice. Describe where the concept specifically exists in real-world systems or provide advanced case studies.
-
-8. **Math Equations:** Render all mathematical expressions using KaTeX notation. Use inline equations (`$...$`) for formulas embedded within text, and block equations (`$$...$$`) for standalone or complex formulas that deserve their own line.
-
-9. **Content Curation (Priority):** You are explicitly authorized and required to filter the input. Retain only high-value technical concepts, critical logic, and scientific facts. Ruthlessly eliminate redundancy, introductory fluff, rhetorical transitions, or non-technical filler to ensure the output is logically sound and maximally concise.
-
-10. **Editorial Logic (Mandatory):** Provide `retained` and `omitted` arrays justifying your curation choices — which key concepts were prioritized and which sections were dropped, and why. These fields must appear **immediately after** `name` and `summary` in the output JSON, before all other fields.
+10. **More (Mandatory):** Bridge theory and practice. Describe where these core concepts are actively implemented in real-world industry architectures, or how they manifest in observable natural/physical phenomena.
+11. **Updates (Conditional):** If you omitted outdated/deprecated knowledge in constraint #4, or if the book's theory has evolved, use this field to detail the modern standards, current scientific consensus, or architectural replacements. Return `null` if the text's knowledge remains the current state-of-the-art.
+12. **Math Equations:** Render all mathematical expressions using KaTeX. Use inline equations (`$...$`) for embedded formulas, and block equations (`$$...$$`) for standalone formulas.
 
 **Output Format:**
 
@@ -45,19 +50,25 @@ You MUST respond with a single valid JSON object matching this exact schema. Do 
   "retained": [
     {
       "name": "<concept kept>",
-      "reason": "<why it was retained>"
+      "reason": "<why it was retained (e.g., core principle, vital mechanism)>"
     }
   ],
   "omitted": [
     {
       "name": "<concept dropped>",
-      "reason": "<why it was omitted>"
+      "reason": "<why it was omitted (e.g., fluff, outdated knowledge, out of TOC scope)>"
+    }
+  ],
+  "key_terms": [
+    {
+      "term": "<specialized jargon/term>",
+      "definition": "<extremely concise one sentence definition>"
     }
   ],
   "subsections": [
     {
       "name": "<subheading derived from text>",
-      "content": "<main content in Markdown: bullet points, paragraphs, tables>",
+      "content": "<main content in Markdown: core laws, mechanisms, quantitative data, trade-offs>",
       "figures": [
         {
           "caption": "<full alt text of the image>",
@@ -67,29 +78,28 @@ You MUST respond with a single valid JSON object matching this exact schema. Do 
     }
   ],
   "code": {
-    "content": "<code as a string>",
-    "lang": "go|cpp|<other>"
+    "content": "<code or computational simulation string>",
+    "lang": "go|cpp|python|<other>"
   },
   "interview": [
     {
-      "question": "<interview question>",
+      "question": "<practical assessment/interview question>",
       "level": "junior|mid-level|senior",
-      "answer": "<concise technical answer>"
+      "answer": "<concise technical/scientific answer>"
     }
   ],
   "more": [
     {
       "name": "<topic name>",
-      "content": "<real-world implementation, system occurrences, or case studies in Markdown>"
+      "content": "<real-world implementations, industry architectures, or observable natural phenomena in Markdown>"
+    }
+  ],
+  "updates": [
+    {
+      "name": "<technology/theory name>",
+      "content": "<modern standards, scientific consensus, or evolution replacing the outdated knowledge omitted above>"
     }
   ]
 }
-```
 
-Notes:
-- `code` can be `null` if no code block is needed.
-- `interview` can be `null` if no suitable questions exist.
-- `subsections[].figures` can be `null` if the subsection has no figures.
-- `subsections`, `more`, `retained`, `omitted` are always arrays (never null).
-- Each interview item's `level` must be exactly one of: `"junior"`, `"mid-level"`, or `"senior"`.
-- All `content` fields use Markdown formatting.
+```

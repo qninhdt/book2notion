@@ -778,6 +778,88 @@ def build_section(section, sec_idx, book_dir):
             }
         )
 
+    key_terms = section.get("key_terms") or section.get("key_term") or []
+    if key_terms:
+        children = []
+        for item in key_terms:
+            term = item.get("term") or ""
+            definition = item.get("definition") or ""
+            if not term and not definition:
+                continue
+            rich_text = []
+            if term:
+                rich_text.append(_rt(term, bold=True))
+            if definition:
+                prefix = " — " if term else ""
+                rich_text.extend(parse_inline(f"{prefix}{definition}"))
+            children.append(
+                {
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {"rich_text": rich_text},
+                }
+            )
+        if children:
+            blocks.append(
+                {
+                    "type": "toggle",
+                    "toggle": {
+                        "rich_text": [_rt("Key Terms", bold=True, italic=True)],
+                        "color": "green_background",
+                        "children": children,
+                    },
+                }
+            )
+
+    if section.get("more"):
+        children = []
+        for m in section["more"]:
+            children.append(
+                {
+                    "type": "heading_3",
+                    "heading_3": {
+                        "rich_text": [_rt(m["name"], bold=True)],
+                    },
+                }
+            )
+            children.extend(
+                _flatten_children(md_to_blocks(m.get("content", ""), book_dir))
+            )
+        blocks.append(
+            {
+                "type": "toggle",
+                "toggle": {
+                    "rich_text": [_rt("More", bold=True, italic=True)],
+                    "color": "yellow_background",
+                    "children": children,
+                },
+            }
+        )
+
+    updates = section.get("updates") or section.get("update") or []
+    if updates:
+        children = []
+        for u in updates:
+            if u.get("name"):
+                children.append(
+                    {
+                        "type": "heading_3",
+                        "heading_3": {"rich_text": [_rt(u["name"], bold=True)]},
+                    }
+                )
+            children.extend(
+                _flatten_children(md_to_blocks(u.get("content", ""), book_dir))
+            )
+        blocks.append(
+            {
+                "type": "toggle",
+                "toggle": {
+                    "rich_text": [_rt("Update", bold=True, italic=True)],
+                    "color": "orange_background",
+                    "children": children,
+                },
+            }
+        )
+
     if section.get("interview"):
         children = []
         for qa in section["interview"]:
@@ -807,38 +889,12 @@ def build_section(section, sec_idx, book_dir):
                     },
                 }
             )
-        blocks.append({"type": "paragraph", "paragraph": {"rich_text": [_rt("")]}})
         blocks.append(
             {
                 "type": "toggle",
                 "toggle": {
                     "rich_text": [_rt("Interview", bold=True, italic=True)],
                     "color": "blue_background",
-                    "children": children,
-                },
-            }
-        )
-
-    if section.get("more"):
-        children = []
-        for m in section["more"]:
-            children.append(
-                {
-                    "type": "heading_3",
-                    "heading_3": {
-                        "rich_text": [_rt(m["name"], bold=True)],
-                    },
-                }
-            )
-            children.extend(
-                _flatten_children(md_to_blocks(m.get("content", ""), book_dir))
-            )
-        blocks.append(
-            {
-                "type": "toggle",
-                "toggle": {
-                    "rich_text": [_rt("More", bold=True, italic=True)],
-                    "color": "yellow_background",
                     "children": children,
                 },
             }
@@ -973,7 +1029,9 @@ def get_or_create_chapters_db(book_page_id):
     for blk in list_children(book_page_id):
         if blk["type"] == "child_database":
             db_id = blk["id"]
-            return db_id, get_data_source_id(db_id)
+            ds_id = get_data_source_id(db_id)
+            ensure_chapters_db_schema(ds_id)
+            return db_id, ds_id
 
     db = api(
         notion.request,
@@ -987,11 +1045,30 @@ def get_or_create_chapters_db(book_page_id):
                 "properties": {
                     "Name": {"title": {}},
                     "Chapter": {"number": {"format": "number"}},
+                    "Model": {"rich_text": {}},
                 },
             },
         },
     )
     return db["id"], db["data_sources"][0]["id"]
+
+
+def ensure_chapters_db_schema(ds_id):
+    """Ensure chapter data source has required properties."""
+    ds = api(notion.request, path=f"data_sources/{ds_id}", method="GET")
+    existing = set((ds.get("properties") or {}).keys())
+
+    missing = {}
+    if "Model" not in existing:
+        missing["Model"] = {"rich_text": {}}
+
+    if missing:
+        api(
+            notion.request,
+            path=f"data_sources/{ds_id}",
+            method="PATCH",
+            body={"properties": missing},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1020,6 +1097,7 @@ def sync_chapter(ch_ds_id, path, book_dir, ch_num, cache):
 
     with open(path) as f:
         data = json.load(f)
+    model_id = data.get("model") or os.environ.get("LLM_ID") or "unknown"
 
     blocks = []
     for si, sec in enumerate(data.get("sections", []), 1):
@@ -1031,6 +1109,7 @@ def sync_chapter(ch_ds_id, path, book_dir, ch_num, cache):
         properties={
             "Name": {"title": [{"text": {"content": title}}]},
             "Chapter": {"number": ch_num},
+            "Model": {"rich_text": [{"text": {"content": model_id}}]},
         },
     )
     append_blocks(page["id"], blocks)

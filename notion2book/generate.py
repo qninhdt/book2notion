@@ -16,7 +16,7 @@ from .project import OUTPUTS_ROOT, PROMPTS_ROOT, list_output_book_dirs
 
 PROMPT_NAME = "summarize"  # prompts/summarize.md
 
-TIMEOUT_SECONDS = 120  # per LLM call timeout
+TIMEOUT_SECONDS = 300  # per LLM call timeout
 MAX_RETRIES = 3  # number of retry attempts on timeout/error
 MAX_WORKERS = 8  # max concurrent threads per chapter
 
@@ -104,8 +104,10 @@ def process_section(
                     "summary": "",
                     "subsections": [{"name": sec_name, "content": raw}],
                     "code": None,
+                    "key_terms": [],
                     "interview": None,
                     "more": [],
+                    "updates": [],
                     "retained": [],
                     "omitted": [],
                     "_raw_response": True,
@@ -162,17 +164,17 @@ def section_json_to_markdown(data: dict) -> str:
         lines.append("```")
         lines.append("")
 
-    interview = data.get("interview")
-    if interview:
-        lines.append("__*Interview:*__")
+    key_terms = data.get("key_terms") or data.get("key_term")
+    if key_terms:
+        lines.append("__*Key Terms:*__")
         lines.append("")
-        for qa in interview:
-            q = qa.get("question", "")
-            level = qa.get("level", "")
-            a = qa.get("answer", "")
-            level_tag = f" (level: {level})" if level else ""
-            lines.append(f"> **Question:** {q}{level_tag}")
-            lines.append(f"> **Answer:** {a}")
+        for item in key_terms:
+            term = item.get("term", "")
+            definition = item.get("definition", "")
+            if term:
+                lines.append(f"- **{term}**: {definition}")
+            elif definition:
+                lines.append(f"- {definition}")
             lines.append("")
 
     more = data.get("more")
@@ -188,6 +190,33 @@ def section_json_to_markdown(data: dict) -> str:
             if item_content:
                 lines.append(item_content)
                 lines.append("")
+
+    updates = data.get("updates") or data.get("update")
+    if updates:
+        lines.append("__*Update:*__")
+        lines.append("")
+        for item in updates:
+            item_name = item.get("name", "")
+            item_content = item.get("content", "")
+            if item_name:
+                lines.append(f"### {item_name}")
+                lines.append("")
+            if item_content:
+                lines.append(item_content)
+                lines.append("")
+
+    interview = data.get("interview")
+    if interview:
+        lines.append("__*Interview:*__")
+        lines.append("")
+        for qa in interview:
+            q = qa.get("question", "")
+            level = qa.get("level", "")
+            a = qa.get("answer", "")
+            level_tag = f" (level: {level})" if level else ""
+            lines.append(f"> **Question:** {q}{level_tag}")
+            lines.append(f"> **Answer:** {a}")
+            lines.append("")
 
     lines.append("---")
     lines.append("")
@@ -284,8 +313,10 @@ def process_chapter(
                     "summary": f"ERROR: {e}",
                     "subsections": [],
                     "code": None,
+                    "key_terms": [],
                     "interview": None,
                     "more": [],
+                    "updates": [],
                     "retained": [],
                     "omitted": [],
                     "_error": str(e),
@@ -304,8 +335,10 @@ def process_chapter(
                 "summary": "MISSING",
                 "subsections": [],
                 "code": None,
+                "key_terms": [],
                 "interview": None,
                 "more": [],
+                "updates": [],
                 "retained": [],
                 "omitted": [],
             }
@@ -315,7 +348,7 @@ def process_chapter(
 
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(
-            {"chapter": chapter_name, "sections": section_results},
+            {"chapter": chapter_name, "model": model, "sections": section_results},
             f,
             indent=2,
             ensure_ascii=False,
@@ -358,6 +391,16 @@ def _select_chapters(chapters, chapter_indexes):
     return [(i + 1, ch) for i, ch in enumerate(chapters)]
 
 
+def format_toc(chapters: list[dict]) -> str:
+    """Render a compact TOC string for prompt injection."""
+    lines: list[str] = []
+    for i, chapter in enumerate(chapters, 1):
+        lines.append(f"{i}. {chapter.get('name', 'Untitled Chapter')}")
+        for j, section in enumerate(chapter.get("sections") or [], 1):
+            lines.append(f"  {i}.{j} {section.get('name', 'Untitled Section')}")
+    return "\n".join(lines)
+
+
 def run(book=None, chapter_indexes=None, prompt=PROMPT_NAME):
     load_dotenv()
 
@@ -391,7 +434,11 @@ def run(book=None, chapter_indexes=None, prompt=PROMPT_NAME):
             print("No chapters to process.")
             continue
 
-        system_prompt = load_prompt(prompt).replace("{{BOOK_NAME}}", book_dir.name)
+        system_prompt = (
+            load_prompt(prompt)
+            .replace("{{BOOK_NAME}}", book_dir.name)
+            .replace("{{TOC}}", format_toc(chapters))
+        )
         output_dir = book_dir / "chapters"
         output_dir.mkdir(parents=True, exist_ok=True)
 
